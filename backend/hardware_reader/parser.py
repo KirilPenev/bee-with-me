@@ -35,6 +35,10 @@ class BeeFrame:
     gnss_satellites: int
     altitude_m: int
     battery_voltage: float
+    curr_m_rx_bee_rssi: int
+    curr_m_rx_bee_snr: int
+    prev_bee_rx_m_rssi: int
+    prev_bee_rx_m_snr: int
     sos_active: bool
     repeater_mode: bool
     raw_flags: int
@@ -46,6 +50,10 @@ class RepeaterFrame:
     msg_id: int
     dev_sn: int
     battery_voltage: float
+    curr_m_rx_dev_rssi: int
+    curr_m_rx_dev_snr: int
+    prev_dev_rx_m_rssi: int
+    prev_dev_rx_m_snr: int
     event_id: int
 
 
@@ -92,7 +100,7 @@ def _strip_and_verify(raw: str) -> str | None:
 def _parse_bee(fields: list[str]) -> BeeFrame | None:
     # ##30,MsgId,DevSN,HWVer,SWVer,Hour,Min,Sec,Day,Mon,Year,GNSSStatus,Lat,Lng,
     #   Speed,Course,Satellites,Altitude,Flags,BattVol,CurrMothRxBeeRSSI,CurrMothRxBeeSNR,PrevBeeRxMothRSSI,PrevBeeRxMothSNR,EventID
-    if len(fields) < 24:
+    if len(fields) < 25:   # indices 0..24 — EventID at [24] is the last required field
         return None
     try:
         year = int(fields[10])
@@ -126,6 +134,10 @@ def _parse_bee(fields: list[str]) -> BeeFrame | None:
             gnss_satellites=int(fields[16]),
             altitude_m=int(fields[17]),
             battery_voltage=float(fields[19]),
+            curr_m_rx_bee_rssi=int(fields[20]),
+            curr_m_rx_bee_snr=int(fields[21]),
+            prev_bee_rx_m_rssi=int(fields[22]),
+            prev_bee_rx_m_snr=int(fields[23]),
             sos_active=bool(flags & 0x02),
             repeater_mode=bool(flags & 0x01),
             raw_flags=flags,
@@ -137,13 +149,17 @@ def _parse_bee(fields: list[str]) -> BeeFrame | None:
 
 def _parse_repeater(fields: list[str]) -> RepeaterFrame | None:
     # ##20,MsgId,DevSN,HWVer,SWVer,BattVol,CurrMRxDevRSSI,CurrMRxDevSNR,PrevDevRxMRSSI,PrevDevRxMSNR,EventID
-    if len(fields) < 10:
+    if len(fields) < 11:   # indices 0..10 — EventID at [10] is the last required field
         return None
     try:
         return RepeaterFrame(
             msg_id=int(fields[1]),
             dev_sn=int(fields[2]),
             battery_voltage=float(fields[5]),
+            curr_m_rx_dev_rssi=int(fields[6]),
+            curr_m_rx_dev_snr=int(fields[7]),
+            prev_dev_rx_m_rssi=int(fields[8]),
+            prev_dev_rx_m_snr=int(fields[9]),
             event_id=int(fields[10])
         )
     except (ValueError, IndexError):

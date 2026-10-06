@@ -7,5 +7,6 @@ export const NAV_ITEMS = [
   { to: '/groups',  labelKey: 'nav.groups',  icon: '👥'  },
   { to: '/devices', labelKey: 'nav.devices', icon: '📡'  },
   { to: '/export',  labelKey: 'nav.export',  icon: '📤'  },
+  { to: '/selectofflinemap', labelKey: 'nav.selectofflinemap', icon: '📦' },
   { to: '/about',   labelKey: 'nav.about',   icon: 'ℹ️'  },
 ]

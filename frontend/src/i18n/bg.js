@@ -8,6 +8,7 @@ export default {
     export:  'Експорт',
     logout:  'Изход',
     about:   'За нас',
+    selectofflinemap: 'Избор на офлайн карта',
   },
   login: {
     title:    'Bee With Me',
@@ -20,6 +21,10 @@ export default {
   map: {
     trackers:      'Тракери',
     noTrackers:    'Няма активни тракери',
+    noFix:         'без GPS',
+    silenceNotice: 'Няма връзка с {n} тракер(а) над 10 мин',
+    silenceLost:   '{n} над 30 мин',
+    feedLost:      'Връзката на живо е прекъсната — данни към {time}, свързване…',
     searchRank:         'Търсене по звание…',
     serialConnected:    'Gateway свързан',
     serialDisconnected: 'Gateway изключен',
@@ -58,6 +63,7 @@ export default {
       satellite:   'Сателит',
       topo:        'Топо',
       bgmountains: 'БГ Планини',
+      offline: 'Офлайн',
     },
   },
   users: {
@@ -187,6 +193,8 @@ export default {
   sos: {
     active:     '🚨 SOS АКТИВЕН —',
     resolve:    'Разреши',
+    resolving:     'Отмяна…',
+    resolveFailed: 'Неуспешно отменяне — проверете връзката и опитайте отново',
     alertTitle: 'SOS Активиран',
   },
   about: {
@@ -208,6 +216,11 @@ export default {
     offlineMapsPasswordDesc:        'Въведете паролата за офлайн карти, за да започне изтеглянето.',
     offlineMapsPasswordPlaceholder: 'Парола',
     offlineMapsPasswordWrong:       'Грешна парола',
+  },
+  selectOfflinemap: {
+    select: 'Избери карта за офлайн работа',
+    load: 'Избери',
+    loading: 'Зареждане…',
   },
   common: {
     save:   'Запази',

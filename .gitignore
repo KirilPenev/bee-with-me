@@ -48,3 +48,5 @@ data/
 /.npm
 .claude
 CLAUDE.MD
+tile-server/package-lock.json
+tile-server/package.json

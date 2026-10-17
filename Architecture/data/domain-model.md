@@ -74,8 +74,8 @@ erDiagram
     }
     devices {
         uuid id PK
-        int dev_sn UK
-        device_type device_type
+        int dev_sn UK "unique per device_type"
+        device_type device_type UK
         uuid user_id FK
         timestamptz assigned_at
     }

@@ -134,11 +134,15 @@ at-least-once property worth preserving if this code is touched.
 
 ## Before a device appears on the map
 
-An admin must register it in the Devices page with the matching `DevSN`. Until that row
-exists the reader logs:
+An admin must register it in the Devices page with the matching `DevSN` **and type**.
+Serial numbers are unique per type, not globally: bee 10 and repeater 10 are two different
+devices. A Cmd=30 frame only matches a `bee` row and a Cmd=20 frame only matches a
+`repeater` row, so a bee registered as a repeater (or vice versa) is never found. Until the
+matching row exists the reader logs one of:
 
 ```text
-Unknown or inactive device dev_sn=<N> — register it first
+Unknown or inactive bee dev_sn=<N> — register it first
+Unknown or inactive repeater dev_sn=<N> — register it first
 ```
 
 Grep the backend log for that line first when a device is not showing up.
@@ -152,7 +156,7 @@ world or has ever transmitted. A typo'd serial number looks identical to a real 
 | Symptom | Where to look |
 | --- | --- |
 | No frames at all | `GET /api/serial/status` — is the gateway connected, is `frames_received` climbing? |
-| Frames arriving, nothing on the map | Backend log for `Unknown or inactive device dev_sn=` — the registered `DevSN` doesn't match the hardware |
+| Frames arriving, nothing on the map | Backend log for `Unknown or inactive bee dev_sn=` — the registered `DevSN` or type doesn't match the hardware |
 | Every frame rejected | CRC: marker inclusion and decimal encoding (see above). The HID reader logs `HID frame extracted:` with the raw frame |
 | Positions stop updating but device is fine | Radio range. RSSI would show this coming — it isn't captured yet |
 | Tracker greys out / shows an age | Working as intended: freshness is judged on server receive time, see `frontend/src/lib/freshness.js` |

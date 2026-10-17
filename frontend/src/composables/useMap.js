@@ -325,6 +325,10 @@ export function useMap(mapRef, positionList, trails, onCursorMGRS, onMeasure, gr
   let staleTimer    = null
   let hqPlacementMode = false
   let hqLabel = 'ЩАБ'
+  // Repeaters have no GNSS: an admin places each one by hand, like HQ.
+  let repeaterPlacementMode = false
+  let repeaterPlacedCb = null
+  const placing = () => hqPlacementMode || repeaterPlacementMode
 
   // Marker layer
   const source      = new VectorSource()
@@ -371,6 +375,9 @@ export function useMap(mapRef, positionList, trails, onCursorMGRS, onMeasure, gr
   // HQ layer
   const hqSource = new VectorSource()
   const hqLayer  = new VectorLayer({ source: hqSource, zIndex: 15 })
+
+  const repeaterSource = new VectorSource()
+  const repeaterLayer  = new VectorLayer({ source: repeaterSource, zIndex: 14 })
 
   // Weather overlay layer — created/destroyed on demand
   let activeWeatherLayer = null
@@ -694,7 +701,7 @@ export function useMap(mapRef, positionList, trails, onCursorMGRS, onMeasure, gr
 
     map = new Map({
       target:   mapRef.value,
-      layers:   [basemapLayer, burntLayer, zoneLayer, hotspotLayer, graticule, trailLayer, checkpointLayer, hqLayer, vectorLayer, measureLayer],
+      layers:   [basemapLayer, burntLayer, zoneLayer, hotspotLayer, graticule, trailLayer, checkpointLayer, repeaterLayer, hqLayer, vectorLayer, measureLayer],
       view:     new View({ center: fromLonLat([25.0, 42.5]), zoom: 7 }),
       overlays: [tooltip],
       controls: [new ScaleLine({ units: 'metric', bar: false, minWidth: 100 })],
@@ -757,6 +764,11 @@ export function useMap(mapRef, positionList, trails, onCursorMGRS, onMeasure, gr
         onHQPlaced?.({ lat, lon })
         return
       }
+      if (repeaterPlacementMode) {
+        const [lon, lat] = toLonLat(evt.coordinate)
+        repeaterPlacedCb?.({ lat, lon })
+        return
+      }
       if (!measureMode) return
       const [lon, lat] = toLonLat(evt.coordinate)
 
@@ -792,7 +804,7 @@ export function useMap(mapRef, positionList, trails, onCursorMGRS, onMeasure, gr
 
     map.on('click', (evt) => {
       if (clickSwallowed()) return
-      if (hqPlacementMode || measureMode || !fireClickCb) return
+      if (placing() || measureMode || !fireClickCb) return
       // A tracker click opens the tracker popup and closes any fire popup.
       if (trackerHit(evt.pixel)) {
         fireClickCb(null)
@@ -812,7 +824,7 @@ export function useMap(mapRef, positionList, trails, onCursorMGRS, onMeasure, gr
     })
 
     map.on('pointermove', (evt) => {
-      if (evt.dragging || hqPlacementMode || measureMode) return
+      if (evt.dragging || placing() || measureMode) return
       if (trackerHit(evt.pixel)) return
       if (fireHit(evt.pixel)) map.getTargetElement().style.cursor = 'pointer'
     })
@@ -827,7 +839,7 @@ export function useMap(mapRef, positionList, trails, onCursorMGRS, onMeasure, gr
       const now = performance.now()
       if (now - lastContextAt < LONG_PRESS_DEDUPE_MS) return
       lastContextAt = now
-      if (!contextMenuCb || hqPlacementMode || measureMode) return
+      if (!contextMenuCb || placing() || measureMode) return
       const pixel = map.getEventPixel({ clientX, clientY })
       const coordinate = map.getCoordinateFromPixel(pixel)
       if (coordinate) contextMenuCb({ coordinate, pixel })
@@ -939,6 +951,46 @@ export function useMap(mapRef, positionList, trails, onCursorMGRS, onMeasure, gr
     if (map) map.getTargetElement().style.cursor = on ? 'crosshair' : ''
   }
 
+  function makeRepeaterStyle(label, active) {
+    const color = active ? '#22d3ee' : '#64748b'
+    return new Style({
+      image: new RegularShape({
+        points:  3,
+        radius:  11,
+        angle:   0,
+        fill:    new Fill({ color }),
+        stroke:  new Stroke({ color: '#000', width: 2 }),
+      }),
+      text: new Text({
+        text:    label,
+        offsetY: -18,
+        font:    'bold 12px system-ui',
+        fill:    new Fill({ color }),
+        stroke:  new Stroke({ color: '#000', width: 3 }),
+      }),
+    })
+  }
+
+  // Repeaters arrive as device rows; only placed ones (site_latitude/site_longitude set) are drawn.
+  // An inactive repeater stays on the map, greyed, so its spot is not forgotten.
+  function setRepeaters(list) {
+    repeaterSource.clear(true)
+    for (const d of Array.isArray(list) ? list : []) {
+      const lat = Number(d?.site_latitude), lon = Number(d?.site_longitude)
+      if (d?.site_latitude == null || !Number.isFinite(lat) || !Number.isFinite(lon)) continue
+      const f = new Feature({ geometry: new Point(fromLonLat([lon, lat])) })
+      f.setId(`repeater:${d.id}`)
+      f.setStyle(makeRepeaterStyle(d.name || `R${d.dev_sn}`, d.is_active !== false))
+      repeaterSource.addFeature(f)
+    }
+  }
+
+  function setRepeaterPlacementMode(on) {
+    repeaterPlacementMode = on
+    if (map) map.getTargetElement().style.cursor = on ? 'crosshair' : ''
+  }
+  function onRepeaterPlaced(cb) { repeaterPlacedCb = cb }
+
   // Read before clearing: a payload OpenLayers cannot parse keeps the previous features on
   // screen. Returns false so the caller can show the feed as failed (BP-03). The log line
   // carries no feature content.
@@ -999,5 +1051,5 @@ export function useMap(mapRef, positionList, trails, onCursorMGRS, onMeasure, gr
     removeStaleFeatures(list.map(p => p.device_id))
   }
 
-  return { map: () => map, setBasemap, setMGRSGrid, setLatLonGrid, setTrailVisible, setCheckpointNumbers, setMeasureMode, setWeatherLayer, refreshMarkers, setHQ, setHQPlacementMode, setBurntAreas, setHotspots, setFireLayerVisible, setFireLabels, onFireFeatureClick, setZones, onTrackerClick, onMapContextMenu }
+  return { map: () => map, setBasemap, setMGRSGrid, setLatLonGrid, setTrailVisible, setCheckpointNumbers, setMeasureMode, setWeatherLayer, refreshMarkers, setHQ, setHQPlacementMode, setRepeaters, setRepeaterPlacementMode, onRepeaterPlaced, setBurntAreas, setHotspots, setFireLayerVisible, setFireLabels, onFireFeatureClick, setZones, onTrackerClick, onMapContextMenu }
 }

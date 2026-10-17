@@ -1,10 +1,10 @@
 import logging
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 from ..auth import get_current_user, require_role
 from ..database import get_conn
@@ -19,7 +19,7 @@ router = APIRouter(prefix='/api/devices', tags=['devices'])
 class DeviceCreate(BaseModel):
     dev_sn: int
     name: str | None = None
-    device_type: str = 'bee'
+    device_type: Literal['bee', 'repeater'] = 'bee'
     user_id: UUID | None = None
 
 
@@ -33,6 +33,18 @@ class AssignRequest(BaseModel):
     user_id: UUID | None   # None = detach
 
 
+class LocationPatch(BaseModel):
+    """PUT /api/devices/{id}/location: both numbers (set) or both null (clear), like HQ."""
+    latitude:  Annotated[float, Field(strict=True, ge=-90, le=90)] | None
+    longitude: Annotated[float, Field(strict=True, ge=-180, le=180)] | None
+
+    @model_validator(mode='after')
+    def _both_or_neither(self):
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError('latitude and longitude must both be set or both be empty')
+        return self
+
+
 @router.get('/')
 async def list_devices(
     conn: Annotated[asyncpg.Connection, Depends(get_conn)],
@@ -40,10 +52,11 @@ async def list_devices(
 ):
     rows = await conn.fetch("""
         SELECT d.id, d.dev_sn, d.name, d.device_type, d.is_active, d.created_at,
+               d.site_latitude, d.site_longitude,
                u.id AS user_id, u.full_name AS user_name, u.rank AS user_rank
         FROM devices d
         LEFT JOIN users u ON u.id = d.user_id
-        ORDER BY d.dev_sn
+        ORDER BY d.device_type, d.dev_sn
     """)
     return [dict(r) for r in rows]
 
@@ -61,7 +74,7 @@ async def create_device(
             RETURNING id, dev_sn, name, device_type
         """, body.dev_sn, body.name, body.device_type, body.user_id)
     except asyncpg.UniqueViolationError:
-        raise HTTPException(status_code=409, detail='dev_sn already registered')
+        raise HTTPException(status_code=409, detail=f'A {body.device_type} with dev_sn {body.dev_sn} is already registered')
     return dict(row)
 
 
@@ -133,6 +146,31 @@ async def assign_device(
         body.user_id, device_id,
     )
     return {'device_id': str(device_id), 'user_id': str(body.user_id) if body.user_id else None}
+
+
+@router.put('/{device_id}/location')
+async def set_device_location(
+    device_id: UUID,
+    body: LocationPatch,
+    conn: Annotated[asyncpg.Connection, Depends(get_conn)],
+    user: Annotated[asyncpg.Record, Depends(require_role('admin'))],
+):
+    """Place or clear a repeater on the map. Repeaters have no GNSS, so this hand-set point is the only
+    position they have; bees report their own and are refused here."""
+    row = await conn.fetchrow(
+        """UPDATE devices SET site_latitude = $2, site_longitude = $3
+           WHERE id = $1 AND device_type = 'repeater'
+           RETURNING id, dev_sn, name, device_type, site_latitude, site_longitude""",
+        device_id, body.latitude, body.longitude,
+    )
+    if row is None:
+        if await conn.fetchval('SELECT 1 FROM devices WHERE id = $1', device_id):
+            raise HTTPException(status_code=422,
+                                detail='Only a repeater has a hand-set location')
+        raise HTTPException(status_code=404, detail='Device not found')
+    logger.info('Repeater dev_sn=%s location %s by user %s',
+                row['dev_sn'], 'cleared' if body.latitude is None else 'set', user['id'])
+    return dict(row)
 
 
 @router.delete('/{device_id}', status_code=status.HTTP_204_NO_CONTENT)

@@ -45,12 +45,13 @@ People: rescuers, volunteers and operators. Login columns are empty for people w
 | Column | Type | Notes |
 |--------|------|-------|
 | `id` | UUID PK | |
-| `dev_sn` | INTEGER UNIQUE | Serial number in every frame (`docs/PROTOCOL.md`) |
+| `dev_sn` | INTEGER | Serial number in every frame (`docs/PROTOCOL.md`). UNIQUE together with `device_type` (migration 0006): bees and repeaters number independently |
 | `name` | VARCHAR(255) | |
 | `device_type` | `device_type` | `bee` or `repeater` |
 | `user_id` | UUID FK → users, `ON DELETE SET NULL` | Current assignment |
 | `assigned_at` | TIMESTAMPTZ | |
 | `is_active` | BOOL | Frames from inactive devices are not stored (R-07) |
+| `site_latitude`, `site_longitude` | DOUBLE PRECISION, nullable | Hand-set position of a **repeater** (no GNSS); both or neither, and only on `device_type = 'repeater'` (migration 0007) |
 
 ## location_events
 

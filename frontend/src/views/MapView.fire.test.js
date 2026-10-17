@@ -6,6 +6,7 @@ import { ApiError } from '../api/client'
 vi.mock('../api', () => ({
   getSettings: vi.fn(), putSettings: vi.fn(), putHQ: vi.fn(), putHQInitial: vi.fn(), getMe: vi.fn(),
   getGroupsWithMembers: vi.fn(), getSerialStatus: vi.fn(),
+  getDevices: vi.fn(async () => []), setDeviceLocation: vi.fn(),
   getFireHotspots: vi.fn(), getFireBurntAreas: vi.fn(),
   dismissFireHotspot: vi.fn(), createFieldReport: vi.fn(), extinguishFieldReport: vi.fn(),
   getSuppressionZones: vi.fn(), createSuppressionZone: vi.fn(),

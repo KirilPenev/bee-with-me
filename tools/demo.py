@@ -171,7 +171,7 @@ def get_or_create_devices(headers: dict, user_ids: dict) -> dict:
     # deactivated earlier would look missing and its re-create would fail with 409.
     r = httpx.get(f'{BASE}/devices/', headers=headers)
     r.raise_for_status()
-    existing = {d['dev_sn']: d for d in r.json()}
+    existing = {d['dev_sn']: d for d in r.json() if d['device_type'] == 'bee'}
     result = {}
     for u in DEMO_USERS:
         sn = u['dev_sn']

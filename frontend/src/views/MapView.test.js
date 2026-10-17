@@ -5,15 +5,16 @@ import { mount, flushPromises } from '@vue/test-utils'
 vi.mock('../api', () => ({
   getSettings: vi.fn(), putSettings: vi.fn(), putHQ: vi.fn(), putHQInitial: vi.fn(), getMe: vi.fn(),
   getGroupsWithMembers: vi.fn(), getSerialStatus: vi.fn(),
+  getDevices: vi.fn(async () => []), setDeviceLocation: vi.fn(),
   getLive: vi.fn(), getSOS: vi.fn(), getTrail: vi.fn(),
 }))
 vi.mock('../composables/useWebSocket', () => ({ useWebSocket: () => ({ connect: vi.fn() }) }))
-const mapArgs = vi.hoisted(() => ({ onHQPlace: null }))
+const mapArgs = vi.hoisted(() => ({ onHQPlace: null, onRepeaterPlace: null }))
 vi.mock('../composables/useMap', () => ({
   BASEMAPS: [],
   useMap: (...args) => {
     mapArgs.onHQPlace = args[6]
-    return new Proxy({ map: () => null }, {
+    return new Proxy({ map: () => null, onRepeaterPlaced: (cb) => { mapArgs.onRepeaterPlace = cb } }, {
       get: (t, k) => (k in t ? t[k] : vi.fn()),
     })
   },
@@ -21,7 +22,7 @@ vi.mock('../composables/useMap', () => ({
 vi.mock('ol/Overlay', () => ({ default: class {} }))
 vi.mock('ol/proj', () => ({ fromLonLat: (c) => c, toLonLat: (c) => c }))
 
-import { getSettings, putHQ, getGroupsWithMembers, getSerialStatus } from '../api'
+import { getSettings, putHQ, getGroupsWithMembers, getSerialStatus, getDevices, setDeviceLocation } from '../api'
 import MapView from './MapView.vue'
 import { useAuthStore } from '../stores/auth'
 import { useLocationsStore } from '../stores/locations'
@@ -112,5 +113,61 @@ describe('MapView HQ controls', () => {
     expect(w.text()).not.toContain('Settings unavailable')
     const moveBtn = w.findAll('button').find(b => b.text() === en.map.hqMove)
     expect(moveBtn.attributes('disabled')).toBeUndefined()
+  })
+})
+
+describe('MapView repeater placement', () => {
+  const R1 = { id: 'r1', dev_sn: 10, name: 'Ridge', device_type: 'repeater', is_active: true, site_latitude: 42.1, site_longitude: 24.1 }
+  const R2 = { id: 'r2', dev_sn: 11, name: null,    device_type: 'repeater', is_active: true, site_latitude: null, site_longitude: null }
+  const BEE = { id: 'b1', dev_sn: 10, name: 'Bee', device_type: 'bee', is_active: true }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    i18n.global.locale.value = 'en'
+    getSettings.mockResolvedValue({ ...SETTINGS })
+    getGroupsWithMembers.mockResolvedValue({ items: [] })
+    getSerialStatus.mockResolvedValue(null)
+    getDevices.mockResolvedValue([R1, R2, BEE])
+    setDeviceLocation.mockImplementation(async (id, lat, lon) => ({ id, site_latitude: lat, site_longitude: lon }))
+  })
+
+  it('is hidden for non-admins', async () => {
+    const w = await mountMap('viewer')
+    expect(texts(w)).not.toContain(en.map.repeaterSet)
+  })
+
+  it('lists only repeaters and preselects the first unplaced one', async () => {
+    const w = await mountMap('admin')
+    await w.findAll('button').find(b => b.text() === en.map.repeaterSet).trigger('click')
+    const options = w.findAll('select.bm-select option')
+    expect(options.map(o => o.attributes('value'))).toEqual(['r1', 'r2'])
+    expect(w.find('select.bm-select').element.value).toBe('r2')
+  })
+
+  it('a map click saves the selected repeater and leaves placement mode', async () => {
+    const w = await mountMap('admin')
+    await w.findAll('button').find(b => b.text() === en.map.repeaterSet).trigger('click')
+    mapArgs.onRepeaterPlace({ lat: 42.7, lon: 23.3 })
+    await flushPromises()
+    expect(setDeviceLocation).toHaveBeenCalledWith('r2', 42.7, 23.3)
+    expect(w.find('select.bm-select').exists()).toBe(false)
+  })
+
+  it('a failed save shows an error', async () => {
+    setDeviceLocation.mockRejectedValueOnce(new Error('Network Error'))
+    const w = await mountMap('admin')
+    await w.findAll('button').find(b => b.text() === en.map.repeaterSet).trigger('click')
+    mapArgs.onRepeaterPlace({ lat: 1, lon: 1 })
+    await flushPromises()
+    expect(w.text()).toContain(en.map.repeaterSaveFailed)
+  })
+
+  it('Clear location is offered for a placed repeater and clears it', async () => {
+    const w = await mountMap('admin')
+    await w.findAll('button').find(b => b.text() === en.map.repeaterSet).trigger('click')
+    await w.find('select.bm-select').setValue('r1')
+    await w.findAll('button').find(b => b.text() === en.map.repeaterClear).trigger('click')
+    await flushPromises()
+    expect(setDeviceLocation).toHaveBeenCalledWith('r1', null, null)
   })
 })

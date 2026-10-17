@@ -137,7 +137,7 @@ async def seed(conn: asyncpg.Connection, count: int = 6) -> dict[str, asyncpg.Re
         devices: dict[str, asyncpg.Record] = {}
         for u in users:
             uid = user_ids[u['username']]
-            dev = await conn.fetchrow('SELECT id, user_id, is_active FROM devices WHERE dev_sn = $1', u['dev_sn'])
+            dev = await conn.fetchrow("SELECT id, user_id, is_active FROM devices WHERE dev_sn = $1 AND device_type = 'bee'", u['dev_sn'])
             if dev is None:
                 dev = await conn.fetchrow(
                     """INSERT INTO devices (dev_sn, name, device_type, user_id) VALUES ($1,$2,'bee',$3)
@@ -172,7 +172,7 @@ async def seed(conn: asyncpg.Connection, count: int = 6) -> dict[str, asyncpg.Re
 async def reset(conn: asyncpg.Connection) -> dict:
     """Delete every position and SOS alert of the demo trackers. Accounts, devices and teams stay."""
     async with conn.transaction():
-        ids = [r['id'] for r in await conn.fetch('SELECT id FROM devices WHERE dev_sn = ANY($1::int[])', DEMO_SNS)]
+        ids = [r['id'] for r in await conn.fetch("SELECT id FROM devices WHERE dev_sn = ANY($1::int[]) AND device_type = 'bee'", DEMO_SNS)]
         positions = await conn.fetchval(
             'WITH d AS (DELETE FROM location_events WHERE device_id = ANY($1::uuid[]) RETURNING 1) SELECT count(*) FROM d', ids)
         alerts = await conn.fetchval(

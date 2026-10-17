@@ -63,6 +63,21 @@
         <button class="bm-btn" @click="loadSettings">{{ t('map.settingsRetry') }}</button>
       </span>
       <span v-if="hqError" class="bm-hq-error" role="alert">{{ t('map.hqSaveFailed') }}</span>
+      <button v-if="isAdmin && repeaters.length" :class="['bm-btn', { active: repeaterMode }]" @click="toggleRepeaterMode">
+        {{ t('map.repeaterSet') }}
+      </button>
+      <span v-if="isAdmin && repeaterMode" class="bm-hq-confirm">
+        <select v-model="repeaterId" class="bm-select" :aria-label="t('map.repeaterPick')">
+          <option v-for="r in repeaters" :key="r.id" :value="r.id">
+            {{ r.name || `SN:${r.dev_sn}` }}{{ r.site_latitude != null ? ' ✓' : '' }}
+          </option>
+        </select>
+        <span>{{ t('map.repeaterHint') }}</span>
+        <button v-if="selectedRepeater?.site_latitude != null" class="bm-btn bm-btn-danger" @click="clearRepeater">
+          {{ t('map.repeaterClear') }}
+        </button>
+      </span>
+      <span v-if="repeaterError" class="bm-hq-error" role="alert">{{ t('map.repeaterSaveFailed') }}</span>
       <button
         v-for="name in fireLayerButtons" :key="name"
         :class="['bm-btn', { active: fireStore.layers[name] }]"
@@ -311,7 +326,7 @@ import { useAuthStore } from '../stores/auth'
 import { useSettingsStore } from '../stores/settings'
 import { useWebSocket } from '../composables/useWebSocket'
 import { useMap, BASEMAPS } from '../composables/useMap'
-import { getGroupsWithMembers, getSerialStatus, getWeatherBox, getWeatherCurrent } from '../api'
+import { getDevices, getGroupsWithMembers, getSerialStatus, getWeatherBox, getWeatherCurrent, setDeviceLocation } from '../api'
 import { ageMs, contactAt, formatAge, freshnessOf, byUrgency } from '../lib/freshness'
 import { firePillState } from '../lib/fireStyle'
 import { recolorFor, tempLegendGradient } from '../lib/weatherTiles'
@@ -454,7 +469,7 @@ async function saveHQ(action) {
   }
 }
 
-const { map, setBasemap, setMGRSGrid, setLatLonGrid, setTrailVisible, setCheckpointNumbers, setMeasureMode, setWeatherLayer, refreshMarkers, setHQ, setHQPlacementMode, setBurntAreas, setHotspots, setFireLayerVisible, setFireLabels, onFireFeatureClick, setZones, onTrackerClick, onMapContextMenu } = useMap(
+const { map, setBasemap, setMGRSGrid, setLatLonGrid, setTrailVisible, setCheckpointNumbers, setMeasureMode, setWeatherLayer, refreshMarkers, setHQ, setHQPlacementMode, setRepeaters, setRepeaterPlacementMode, onRepeaterPlaced, setBurntAreas, setHotspots, setFireLayerVisible, setFireLabels, onFireFeatureClick, setZones, onTrackerClick, onMapContextMenu } = useMap(
   mapEl,
   displayList,
   computed(() => store.trails),
@@ -729,6 +744,52 @@ watch(() => fireStore.zones, (list) => setZones(list.filter(z => z.is_active)), 
 onTrackerClick(onMarkerClick)
 onMapContextMenu(openContextMenu)
 
+// Repeaters have no GNSS: an admin places each one by hand, like HQ. Everyone sees the placed ones.
+const repeaters     = ref([])
+const repeaterMode  = ref(false)
+const repeaterId    = ref(null)
+const repeaterError = ref(false)
+const selectedRepeater = computed(() => repeaters.value.find(r => r.id === repeaterId.value) || null)
+
+async function loadRepeaters() {
+  try {
+    repeaters.value = (await getDevices()).filter(d => d.device_type === 'repeater')
+  } catch { /* the map does not depend on repeaters; keep what is drawn */ }
+}
+watch(repeaters, (list) => setRepeaters(list), { immediate: true })
+
+async function saveRepeater(id, lat, lon) {
+  repeaterError.value = false
+  try {
+    const row = await setDeviceLocation(id, lat, lon)
+    repeaters.value = repeaters.value.map(r => (r.id === id ? { ...r, ...row } : r))
+  } catch {
+    repeaterError.value = true
+  }
+}
+onRepeaterPlaced(({ lat, lon }) => {
+  if (!repeaterId.value) return
+  repeaterMode.value = false
+  setRepeaterPlacementMode(false)
+  saveRepeater(repeaterId.value, lat, lon)
+})
+function clearRepeater() {
+  if (!repeaterId.value) return
+  repeaterMode.value = false
+  setRepeaterPlacementMode(false)
+  saveRepeater(repeaterId.value, null, null)
+}
+function toggleRepeaterMode() {
+  repeaterMode.value = !repeaterMode.value
+  if (repeaterMode.value) {
+    // Default to the first repeater not yet placed, so placing a fresh batch is click, click, click.
+    if (!selectedRepeater.value) repeaterId.value = (repeaters.value.find(r => r.site_latitude == null) || repeaters.value[0])?.id ?? null
+    if (measureOn.value) { measureOn.value = false; setMeasureMode(false) }
+    if (hqMode.value) { hqMode.value = false; setHQPlacementMode(false) }
+  }
+  setRepeaterPlacementMode(repeaterMode.value)
+}
+
 onMounted(async () => {
   await Promise.all([store.fetchLive(), store.fetchSOS(), store.fetchTrail()])
   connect()
@@ -744,6 +805,7 @@ onMounted(async () => {
   // HQ comes from the database. A failure shows an amber note with a retry; the map and live
   // data do not depend on it.
   await loadSettings()
+  await loadRepeaters()
 
   tickTimer = setInterval(() => { nowTick.value = Date.now() }, 10_000)
 })
@@ -763,6 +825,7 @@ onUnmounted(() => {
   onFireFeatureClick(null)
   onTrackerClick(null)
   onMapContextMenu(null)
+  onRepeaterPlaced(null)
   closeContextMenu()
   if (fireOverlay) fireMap?.removeOverlay(fireOverlay)
   if (focusOverlay) fireMap?.removeOverlay(focusOverlay)
@@ -809,6 +872,10 @@ function toggleMeasure() {
     hqMode.value = false
     setHQPlacementMode(false)
   }
+  if (measureOn.value && repeaterMode.value) {
+    repeaterMode.value = false
+    setRepeaterPlacementMode(false)
+  }
   setMeasureMode(measureOn.value)
 }
 function toggleHQMode() {
@@ -816,6 +883,10 @@ function toggleHQMode() {
   if (hqMode.value && measureOn.value) {
     measureOn.value = false
     setMeasureMode(false)
+  }
+  if (hqMode.value && repeaterMode.value) {
+    repeaterMode.value = false
+    setRepeaterPlacementMode(false)
   }
   setHQPlacementMode(hqMode.value)
 }
@@ -1145,7 +1216,7 @@ function consumeFireFocus() {
   focusRingTimer = setTimeout(() => { focusRingKey.value = 0; focusOverlay?.setPosition(undefined) }, FOCUS_RING_MS)
 }
 watch(() => fireStore.focusRequest, consumeFireFocus)
-onActivated(() => { mapActive.value = true; nextTick(consumeFireFocus) })
+onActivated(() => { mapActive.value = true; nextTick(consumeFireFocus); loadRepeaters() })
 onDeactivated(() => { mapActive.value = false })
 
 function focusDevice(pos) {
@@ -1205,6 +1276,7 @@ function batClass(v) {
 .bm-hq-confirm { color: var(--text); }
 .bm-hq-note { color: var(--warning); }
 .bm-btn:disabled { opacity: .45; cursor: not-allowed; }
+.bm-select { background: var(--bg-panel); border: 1px solid var(--border); color: var(--text); padding: 4px 6px; font-size: 12px; border-radius: 4px; width: auto; }
 .bm-row-break { flex-basis: 100%; height: 0; }
 
 /* Fire data freshness. Neutral when live, muted when quiet or unknown, amber (never red)

@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Serial numbers are unique per device type
+
+Bees and repeaters number their serials independently, so bee 10 and repeater 10 can now both be
+registered (migration 0006 replaces `UNIQUE (dev_sn)` with `UNIQUE (dev_sn, device_type)`). A Cmd=30
+frame only matches a registered **bee**, a Cmd=20 frame only a **repeater**; the "Unknown or inactive"
+log line now names which kind was looked for. The device type can no longer be changed in the edit form
+(it was silently ignored before).
+
+### Set repeater location
+
+Repeaters have no GNSS, so admins can now place them by hand from the map toolbar, like HQ:
+**Set repeater location**, pick the repeater, click the map. Placed repeaters show for everyone as a
+cyan triangle (grey when the device is inactive). Stored on `devices.site_latitude`/`site_longitude`
+(migration 0007, repeaters only), set through `PUT /api/devices/{id}/location`.
+
 ## [1.7.2] - 2026-10-10
 
 ### Test mode in Settings

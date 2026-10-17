@@ -42,7 +42,7 @@
           <input v-model="form.name" placeholder="e.g. Unit-01" />
         </div>
         <div class="form-group"><label>{{ t('devices.form.type') }}</label>
-          <select v-model="form.device_type">
+          <select v-model="form.device_type" :disabled="!!editing">
             <option value="bee">RescuerBee</option>
             <option value="repeater">RescuerRepeater</option>
           </select>

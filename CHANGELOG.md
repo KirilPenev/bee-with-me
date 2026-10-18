@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Start works offline; updating is a separate step
+
+`start.ps1` / `start.bat` / `./start.sh` no longer install anything or touch the database schema, so an
+everyday start never needs the internet (before, every start ran `pip install`, which hangs offline).
+After new code arrives (`git pull` or a USB copy), and on the first install, run **`update.ps1` /
+`update.bat` / `./update.sh`**: it installs only the dependencies whose lock file changed, backs the
+database up, applies new migrations and starts the app. Starting new code without updating stops with
+`DATABASE NEEDS UPDATING` instead of migrating behind your back. A fresh, empty database is still
+migrated by the backend by itself. See ADR 20.
+
+### Fixed: start refused on folders copied from a Mac
+
+macOS leaves hidden `._<name>` files next to every file it copies to a FAT/exFAT stick or an SMB share; the
+migration runner took `._0001_baseline.sql` for a badly named migration and refused to start. Hidden files
+are now ignored.
+
 ### Serial numbers are unique per device type
 
 Bees and repeaters number their serials independently, so bee 10 and repeater 10 can now both be

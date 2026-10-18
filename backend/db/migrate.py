@@ -17,8 +17,12 @@ of the up section, including a comment, does and is logged as "changed after app
                                           # 3 database not reachable, 1 bad files / failed migration
     python -m backend.db.migrate up
 
-Pending migrations are applied (by `up` and at start-up) only when the database has no user tables
-yet (fresh install), when ALLOW_MIGRATE_WITHOUT_BACKUP=true (dev data only; logs a WARNING), or when
+`up` is run by update.ps1 / update.sh right after their backup. Backend start-up only applies
+migrations to a fresh database (or with ALLOW_MIGRATE_WITHOUT_BACKUP=true); an existing database with
+pending migrations makes the backend refuse to start and name the update script.
+
+Pending migrations are applied (by `up`, and at start-up as above) only when the database has no user
+tables yet (fresh install), when ALLOW_MIGRATE_WITHOUT_BACKUP=true (dev data only; logs a WARNING), or when
 the backup marker (settings.backup_marker_path, written by scripts/backup.ps1 / backup.sh) shows a
 backup of THIS server (same system_identifier) and database (same name) in its current state (same
 applied versions), taken less than 24 h ago (and not in the future), and its dump (a plain file name
@@ -90,6 +94,10 @@ _CREATE_TABLE = """
 
 class MigrationError(RuntimeError):
     pass
+
+
+class UpdateRequiredError(MigrationError):
+    """An existing database has pending migrations: run update.ps1 / update.sh (backup, then migrate)."""
 
 
 class BackupRequiredError(MigrationError):
@@ -179,6 +187,10 @@ def load_migrations(directory: Path | None = None) -> list[Migration]:
     directory = directory or MIGRATIONS_DIR
     migrations = []
     for path in sorted(directory.glob('*.sql')):
+        # Hidden files are never migrations: macOS writes an AppleDouble "._<name>" next to every file it
+        # copies to a FAT/exFAT stick or an SMB share, and a field install is often copied that way.
+        if path.name.startswith('.'):
+            continue
         match = _NAME_RE.match(path.name)
         if not match:
             raise MigrationError(f'Bad migration file name {path.name!r}: expected NNNN_lower_snake.sql')
@@ -272,11 +284,16 @@ _USER_TABLES_SQL = """
 """
 
 
+async def has_user_tables(conn: asyncpg.Connection) -> bool:
+    """False on a fresh install (no tables but the ones extensions create): nothing there to lose."""
+    return bool(await conn.fetchval(_USER_TABLES_SQL))
+
+
 async def _require_backup(conn: asyncpg.Connection, current: Status) -> None:
     """Refuse pending migrations on a database with data unless a matching, recent backup exists."""
     if not current.pending:
         return
-    if not await conn.fetchval(_USER_TABLES_SQL):
+    if not await has_user_tables(conn):
         return   # fresh install: nothing to lose
     from ..config import settings
     pending = ', '.join(current.pending)
@@ -289,7 +306,7 @@ async def _require_backup(conn: asyncpg.Connection, current: Status) -> None:
         raise BackupRequiredError(
             f'Not applying pending migration(s) {pending}: they need a backup of THIS database first '
             f'({problem}). Run scripts/backup.ps1 (Windows) or scripts/backup.sh into data/backups, or '
-            f'start with start.ps1 / start.sh, which back up before migrating; see README, Backup and restore.'
+            f'run update.ps1 / update.sh, which back up before migrating; see README, Backup and restore.'
         )
 
 

@@ -175,7 +175,7 @@ def test_readme_says_skip_containers_skips_the_backup():
     text = _read('README.md')
     assert re.search(r'-SkipContainers.{0,400}backup', text, re.DOTALL)
     assert re.search(r'--skip-containers.{0,400}backup', text, re.DOTALL)
-    section = text[text.index('### 2. Database'):text.index('The backend creates')]
+    section = text[text.index('### 2. Database'):text.index('### Start vs update')]
     assert 'podman-machine' in section
 
 
@@ -262,7 +262,7 @@ def test_git_ignores_dumps(path):
 
 # ── B9: retry only "unreachable" (3); invalid files (1) refuse at once ───────
 
-_INVALID = 'migration files are invalid: see the message above'
+_INVALID = 'migration files are invalid, or the backend cannot load: see the message above'
 
 
 def _migration_section(rel):

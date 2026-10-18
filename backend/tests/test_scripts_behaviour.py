@@ -90,7 +90,8 @@ def project(tmp_path, _venv, postgres_port):
     return proj
 
 
-def _run(kind, project, tmp_path, *, engine='podman', migrate='0', wait=None, args=(), bash_path_prepend=None, **stub):
+def _run(kind, project, tmp_path, *, engine='podman', migrate='0', wait=None, args=(), bash_path_prepend=None, update=True, **stub):
+    # update=True runs the script as update.ps1 / update.sh do (deps + backup + migrate); False is a plain start.
     log = tmp_path / 'calls.log'
     log.write_text('', encoding='utf-8')
     if kind == 'sh':
@@ -118,9 +119,9 @@ def _run(kind, project, tmp_path, *, engine='podman', migrate='0', wait=None, ar
     env.update({f'BWM_STUB_{k.upper()}': v for k, v in stub.items()})
     if kind == 'ps':
         cmd = [PS_EXE, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(project / 'start.ps1'), '-NoBrowser',
-               *args]
+               *(['-Update'] if update else []), *args]
     else:
-        cmd = [BASH, (project / 'start.sh').as_posix(), '--no-browser', *args]
+        cmd = [BASH, (project / 'start.sh').as_posix(), '--no-browser', *(['--update'] if update else []), *args]
         if bash_path_prepend:
             # Git Bash's launcher puts /mingw64/bin:/usr/bin in front of the inherited PATH, so fakes of
             # openssl/base64 only win when PATH is set inside bash, right before the script runs. The script
@@ -159,8 +160,47 @@ def test_pending_migrations_back_up_before_the_start(kind, project, tmp_path):
     assert res.returncode == 0, res.out
     backups = _backups(res)
     assert len(backups) == 1 and 'backups' in backups[0], res.calls
-    assert res.calls.index('migrate status') < res.calls.index(backups[0])
+    assert res.calls.index('migrate status') < res.calls.index(backups[0]) < res.calls.index('migrate up')
     assert res.out.index('STUB BACKUP DONE') < res.out.index(DRY)
+
+
+@pytest.mark.parametrize('kind', KINDS)
+def test_failing_migrate_up_refuses_to_start_and_names_the_backup(kind, project, tmp_path):
+    res = _run(kind, project, tmp_path, migrate='10', migrate_up_exit='1')
+    assert res.returncode != 0
+    assert DRY not in res.out and len(_backups(res)) == 1
+    assert 'Migrating failed' in res.out and 'backups' in res.out
+
+
+# ── Plain start (no --update): offline, never installs or migrates ────────────
+
+@pytest.mark.parametrize('kind', KINDS)
+def test_plain_start_installs_nothing_and_never_touches_the_schema(kind, project, tmp_path):
+    res = _run(kind, project, tmp_path, migrate='10', update=False)
+    assert res.returncode == 0, res.out
+    assert DRY in res.out
+    assert not any(c.startswith('pip ') for c in res.calls), res.calls
+    assert _migrates(res) == [] and _backups(res) == []
+    assert any(' compose -p bee-with-me ' in c and c.rstrip().endswith('up -d') for c in res.calls), res.calls
+
+
+@pytest.mark.parametrize('kind', KINDS)
+def test_plain_start_without_a_venv_points_to_the_update_script(kind, project, tmp_path):
+    shutil.rmtree(project / '.venv')
+    res = _run(kind, project, tmp_path, update=False)
+    assert res.returncode != 0
+    assert DRY not in res.out and 'update' in res.out and 'not installed yet' in res.out
+
+
+@pytest.mark.parametrize('kind', KINDS)
+def test_update_skips_pip_when_requirements_are_unchanged(kind, project, tmp_path):
+    first = _run(kind, project, tmp_path, migrate='0')
+    assert first.returncode == 0, first.out
+    assert any(c.startswith('pip ') for c in first.calls)
+    again = _run(kind, project, tmp_path, migrate='0')
+    assert again.returncode == 0, again.out
+    assert not any(c.startswith('pip ') for c in again.calls), again.calls
+    assert 'requirements.txt unchanged' in again.out
 
 
 @pytest.mark.Trait("Bug", "B14")
@@ -206,7 +246,7 @@ def test_unreachable_database_refuses_after_the_retries(kind, project, tmp_path)
 def test_database_coming_up_late_is_retried_then_backed_up(kind, project, tmp_path):
     res = _run(kind, project, tmp_path, migrate='3,10', wait=30)
     assert res.returncode == 0, res.out
-    assert len(_migrates(res)) == 2 and len(_backups(res)) == 1
+    assert _migrates(res) == ['migrate status', 'migrate status', 'migrate up'] and len(_backups(res)) == 1
     assert DRY in res.out
 
 

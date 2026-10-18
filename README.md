@@ -53,7 +53,7 @@ Offline people-tracking application for LoRaWAN-based rescue and volunteer opera
 cp .env.example .env
 ```
 
-(`start.sh` / `start.ps1` do this on first start and generate `SECRET_KEY` for you.) Then edit `.env`;
+(`update.sh` / `update.ps1` do this on the first run and generate `SECRET_KEY` for you.) Then edit `.env`;
 at minimum set `POSTGRES_PASSWORD`, `OFFLINE_MAPS_PASSWORD` and the HID gateway's VID/PID. The backend logs an
 `INSECURE CONFIG` warning on every start while a secret still has its example value.
 
@@ -88,9 +88,21 @@ podman compose -p bee-with-me -f docker/docker-compose.yaml up -d
 Podman on Windows/macOS also needs the `docker-compose.podman-machine.yaml` override — see
 "Podman on Windows/macOS (podman machine)" below.
 
-The backend creates and upgrades the schema itself on start-up: numbered files in
-`backend/db/migrations/` are applied in order and recorded in the `schema_migrations` table.
-Check the state at any time with:
+### Start vs update
+
+| Script | When | Network | Database schema |
+|--------|------|---------|-----------------|
+| `start.ps1` / `start.bat` / `./start.sh` | Every day | Never | Never changed |
+| `update.ps1` / `update.bat` / `./update.sh` | First run on a machine, and after new code arrives (`git pull` or a USB copy) | Only when `requirements.txt` or `package-lock.json` changed | Backed up, then migrated |
+
+`update` installs only the dependencies whose lock file changed since the last successful install
+(stamps in `.venv/.requirements.sha256` and `frontend/node_modules/.package-lock.sha256`), takes a
+backup into `data/backups/` when migrations are pending, applies them, then starts the app like `start`.
+
+Migrations are numbered files in `backend/db/migrations/`, applied in order and recorded in the
+`schema_migrations` table. The backend applies them by itself only to a fresh, empty database; on a
+database with data and pending migrations it refuses to start with `DATABASE NEEDS UPDATING` and names
+the update script. Check the state at any time with:
 
 ```bash
 python -m backend.db.migrate status   # exit 0 = up to date, 10 = pending, 2 = database is newer than the app, 3 = database not reachable, 1 = invalid migration files / failed migration
@@ -101,19 +113,21 @@ Every migration file runs under a lock timeout (`MIGRATION_LOCK_TIMEOUT`, defaul
 error naming the file instead of hanging. Nothing is changed; stop the backend and other tools using
 the database, then start again.
 
-The start scripts retry only exit 3 (Postgres still starting) for up to 90 s; exit 1 and 2 refuse at once.
+The update scripts retry only exit 3 (Postgres still starting) for up to 90 s; exit 1 and 2 refuse at once.
+Exit 1 is also any Python error while loading the backend (for example a package missing after a failed
+offline `pip install`), so read the message above it.
 
-The start scripts take a backup (`data/backups/`) before applying pending migrations, and refuse to
-start when they cannot check the database for 90 s. `-SkipContainers` (start.ps1) / `--skip-containers`
-(start.sh) also skips this check and the automatic pre-migration backup — take one manually with
-`scripts/backup.ps1` / `scripts/backup.sh` first.
+The update scripts take a backup (`data/backups/`) before applying pending migrations, and refuse to
+continue when they cannot check the database for 90 s. `-SkipContainers` / `--skip-containers` also skips
+the migration step — take a backup manually with `scripts/backup.ps1` / `scripts/backup.sh` and run
+`python -m backend.db.migrate up` yourself.
 
 The backend itself also refuses to apply pending migrations to a database that already holds data
 unless a backup of *that* database was taken first: every backup writes `last-backup.json` next to the
 dump (server `system_identifier`, applied migrations, dump name, time), and the backend migrates only
 when `data/backups/last-backup.json` (setting `BACKUP_MARKER_PATH`) is of the same server, in the
 current migration state, and less than 24 h old. A fresh, empty database needs no backup. A refusal
-changes nothing; run the start script (or `scripts/backup.ps1 -OutDir data\backups` /
+changes nothing; run the update script (or `scripts/backup.ps1 -OutDir data\backups` /
 `./scripts/backup.sh data/backups`) and start again. The start scripts run uvicorn without `--reload`,
 so a `git pull` never migrates a running field install behind your back. Developers who want hot
 reload start uvicorn by hand with `ALLOW_MIGRATE_WITHOUT_BACKUP=true` — on development data only:

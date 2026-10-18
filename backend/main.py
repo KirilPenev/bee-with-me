@@ -15,7 +15,7 @@ from .auth import hash_password
 from .config import settings
 from .version import APP_VERSION
 from .database import close_pool, get_pool, init_pool
-from .db.migrate import BackupRequiredError, MigrationError, migrate
+from .db.migrate import BackupRequiredError, MigrationError, UpdateRequiredError, has_user_tables, migrate, status
 from .routers import auth, devices, export, fire, groups, locations, users, ws, test, hardware_reader, tiles, weather
 from .routers import settings as settings_router
 from .ws import manager
@@ -102,19 +102,32 @@ def _warn_insecure_defaults() -> None:
 
 
 async def _run_migrations() -> None:
-    """Bring the schema up to date before anything touches the database.
+    """Make sure the schema matches this code before anything touches the database.
 
-    Unlike the insecure-defaults check this refuses to start: running on a half-migrated schema
-    would fail in confusing ways mid-operation. Each migration runs in a transaction, so a failure
-    leaves the database exactly as it was before that file.
+    Boot only migrates when nothing can be lost: a fresh database (first start) or development data
+    (ALLOW_MIGRATE_WITHOUT_BACKUP=true). An existing database with pending migrations is left as it is
+    and the backend refuses to start: update.ps1 / update.sh back it up and migrate it, so a routine
+    start never changes the schema. Unlike the insecure-defaults check this refuses to start: running
+    on a half-migrated schema would fail in confusing ways mid-operation.
     """
     async with get_pool().acquire() as conn:
         try:
+            current = await status(conn)
+            if current.pending and not settings.allow_migrate_without_backup and await has_user_tables(conn):
+                raise UpdateRequiredError(
+                    f'This version of Bee With Me needs database migration(s) {", ".join(current.pending)}')
             applied = await migrate(conn)
+        except UpdateRequiredError as exc:
+            logger.critical('=' * 72)
+            logger.critical('DATABASE NEEDS UPDATING: %s', exc)
+            logger.critical('Nothing was changed. Stop here and run update.ps1 (Windows) or update.sh: it backs up '
+                            'the database, migrates it, then starts the app.')
+            logger.critical('=' * 72)
+            raise
         except BackupRequiredError as exc:
             logger.critical('=' * 72)
             logger.critical('NOT MIGRATING THE DATABASE: %s', exc)
-            logger.critical('Nothing was changed. Start with start.ps1 / start.sh (they back up first), or '
+            logger.critical('Nothing was changed. Run update.ps1 / update.sh (it backs up first), or '
                             'run scripts/backup.ps1 / scripts/backup.sh -> data/backups, then start again.')
             logger.critical('Development data only: ALLOW_MIGRATE_WITHOUT_BACKUP=true skips this check.')
             logger.critical('=' * 72)
@@ -123,7 +136,7 @@ async def _run_migrations() -> None:
             logger.critical('=' * 72)
             logger.critical('DATABASE MIGRATION FAILED: %s', exc)
             logger.critical('The failed migration was rolled back; the database is as it was before it.')
-            logger.critical('The start script took a backup before migrating: see data/backups/.')
+            logger.critical('The update script took a backup before migrating: see data/backups/.')
             logger.critical('To go back to it: stop the backend, then run scripts/restore.ps1 (Windows) or '
                             'scripts/restore.sh with that dump (see README, Backup and restore).')
             logger.critical('=' * 72)

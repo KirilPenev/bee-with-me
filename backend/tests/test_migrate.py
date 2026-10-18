@@ -34,6 +34,13 @@ def test_load_rejects_bad_file_names(tmp_path, name):
         m.load_migrations(tmp_path)
 
 
+def test_load_skips_macos_appledouble_files(tmp_path):
+    # A folder copied from a Mac to FAT/exFAT/SMB carries "._<name>" companions: binary metadata, not SQL.
+    _write(tmp_path, '0001_a.sql', 'CREATE TABLE a (id int);')
+    (tmp_path / '._0001_a.sql').write_bytes(b'\x00\x05\x16\x07\x00\x02\x00\x00Mac OS X')
+    assert [x.name for x in m.load_migrations(tmp_path)] == ['0001_a']
+
+
 @pytest.mark.Trait("Task", "T3")
 def test_load_rejects_missing_up_marker(tmp_path):
     (tmp_path / '0001_a.sql').write_text('CREATE TABLE a (id int);', encoding='utf-8')

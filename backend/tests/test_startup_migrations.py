@@ -5,7 +5,7 @@ import logging
 import pytest
 
 from backend import main
-from backend.db.migrate import MigrationError
+from backend.db.migrate import MigrationError, Status, UpdateRequiredError
 
 
 class _Pool:
@@ -24,6 +24,44 @@ class _Pool:
         return _Ctx()
 
 
+def _db(monkeypatch, *, pending, populated):
+    async def status(conn):
+        return Status(applied=[], pending=pending, unknown=[], changed=[])
+
+    async def has_user_tables(conn):
+        return populated
+    monkeypatch.setattr(main, 'get_pool', lambda: _Pool(object()))
+    monkeypatch.setattr(main, 'status', status)
+    monkeypatch.setattr(main, 'has_user_tables', has_user_tables)
+
+
+@pytest.mark.asyncio
+async def test_boot_refuses_pending_migrations_on_a_database_with_data(monkeypatch, caplog):
+    called = []
+
+    async def migrate(conn):
+        called.append(1)
+        return []
+    _db(monkeypatch, pending=['0006', '0007'], populated=True)
+    monkeypatch.setattr(main, 'migrate', migrate)
+    monkeypatch.setattr(main.settings, 'allow_migrate_without_backup', False)
+    with caplog.at_level(logging.CRITICAL), pytest.raises(UpdateRequiredError):
+        await main._run_migrations()
+    assert called == []
+    assert 'DATABASE NEEDS UPDATING' in caplog.text and '0006, 0007' in caplog.text and 'update.ps1' in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('populated, allow', [(False, False), (True, True)])
+async def test_boot_migrates_a_fresh_database_or_dev_data(monkeypatch, populated, allow):
+    async def migrate(conn):
+        return ['0001']
+    _db(monkeypatch, pending=['0001'], populated=populated)
+    monkeypatch.setattr(main, 'migrate', migrate)
+    monkeypatch.setattr(main.settings, 'allow_migrate_without_backup', allow)
+    await main._run_migrations()
+
+
 @pytest.mark.Trait("Task", "T4")
 def test_old_startup_alter_block_is_removed():
     assert not hasattr(main, '_ensure_schema_migrations')
@@ -34,7 +72,7 @@ def test_old_startup_alter_block_is_removed():
 async def test_run_migrations_logs_operator_message_and_reraises(monkeypatch, caplog):
     async def boom(conn):
         raise MigrationError('Migration 0002_x failed: syntax error')
-    monkeypatch.setattr(main, 'get_pool', lambda: _Pool(object()))
+    _db(monkeypatch, pending=['0002'], populated=False)
     monkeypatch.setattr(main, 'migrate', boom)
     with caplog.at_level(logging.CRITICAL), pytest.raises(MigrationError):
         await main._run_migrations()
@@ -47,7 +85,7 @@ async def test_run_migrations_logs_operator_message_and_reraises(monkeypatch, ca
 async def test_run_migrations_logs_applied_versions(monkeypatch, caplog):
     async def ok(conn):
         return ['0001']
-    monkeypatch.setattr(main, 'get_pool', lambda: _Pool(object()))
+    _db(monkeypatch, pending=['0001'], populated=False)
     monkeypatch.setattr(main, 'migrate', ok)
     with caplog.at_level(logging.INFO):
         await main._run_migrations()

@@ -6,6 +6,12 @@
     This script lives in the project root and uses its own location to find the
     project, so it works wherever the folder is copied to.
 
+    A normal start needs no internet and never changes the database schema. After new code
+    arrives (git pull, or a copy from a USB stick) run update.ps1 instead: it installs changed
+    dependencies, backs the database up, applies new migrations, then starts the app. The
+    first run on a new machine is also update.ps1 (it needs the internet once for the
+    dependencies).
+
 .PARAMETER ProjectPath
     Path to the bee-with-me project folder. Defaults to the folder this script
     is in.
@@ -15,6 +21,9 @@
 
 .PARAMETER NoBrowser
     Don't auto-open the frontend in the default browser once it's up.
+
+.PARAMETER Update
+    What update.ps1 runs: also install changed dependencies and back up + migrate the database.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\start.ps1
@@ -27,7 +36,8 @@ param(
     [string]$ProjectPath = $PSScriptRoot,
     [Alias('SkipDocker')]
     [switch]$SkipContainers,
-    [switch]$NoBrowser
+    [switch]$NoBrowser,
+    [switch]$Update
 )
 
 $ErrorActionPreference = 'Stop'
@@ -250,8 +260,11 @@ if (-not $SkipContainers) {
     }
 }
 
-# -- Python venv + backend deps -----------------------------------------------
+# -- Python venv + backend deps (update only) ----------------------------------
 $venvActivate = "$root\.venv\Scripts\Activate.ps1"
+if (-not $Update -and -not (Test-Path $venvActivate)) {
+    throw "The backend is not installed yet ($root\.venv is missing). Run update.ps1 once (it needs the internet for the dependencies):`n  powershell -ExecutionPolicy Bypass -File `"$root\update.ps1`""
+}
 if (-not (Test-Path $venvActivate)) {
     Write-Step 'Creating Python virtual environment (.venv)'
     $py = if (Get-Command python -ErrorAction SilentlyContinue) { 'python' }
@@ -263,15 +276,31 @@ if (-not (Test-Path $venvActivate)) {
     }
 }
 
-Write-Step 'Installing/checking backend dependencies'
-Invoke-Native { & "$root\.venv\Scripts\python.exe" -m pip install -q -r "$root\backend\requirements.txt" }
-if ($LASTEXITCODE -ne 0) {
-    # Offline laptops still start with what is installed; a missing package shows up when the backend starts.
-    Write-Warn "pip install failed (exit $LASTEXITCODE; offline?) - continuing with the packages already in .venv."
+# pip only runs when requirements.txt is new or changed since the last successful install: an update
+# copied from a USB stick has to work offline, and pip needs the network even when everything is
+# installed already. The stamp is written only after a successful install, so a failed one is retried.
+$req      = "$root\backend\requirements.txt"
+$reqStamp = "$root\.venv\.requirements.sha256"
+$reqHash  = (Get-FileHash -Algorithm SHA256 -LiteralPath $req).Hash.ToLowerInvariant()
+if (-not $Update) {
+    # A normal start installs nothing.
+} elseif ((Test-Path -LiteralPath $reqStamp) -and ((Get-Content -LiteralPath $reqStamp -Raw).Trim() -eq $reqHash)) {
+    Write-Step 'Backend dependencies up to date (requirements.txt unchanged)'
+} else {
+    Write-Step 'Installing backend dependencies (requirements.txt is new or changed)'
+    Invoke-Native { & "$root\.venv\Scripts\python.exe" -m pip install -q --disable-pip-version-check --retries 1 --timeout 10 -r $req }
+    if ($LASTEXITCODE -ne 0) {
+        # Offline laptops still start with what is installed; a missing package shows up when the backend starts.
+        Write-Warn "pip install failed (exit $LASTEXITCODE; offline?) - continuing with the packages already in .venv."
+    } else {
+        Set-Content -LiteralPath $reqStamp -Value $reqHash -Encoding ascii
+    }
 }
 
-# -- Database migrations: back up first if any are pending ---------------------
-if (-not $SkipContainers) {
+# -- Database migrations (update only): back up first, then migrate -------------
+# A normal start leaves the schema alone; the backend refuses to start on pending migrations and names
+# update.ps1 (a fresh, empty database it migrates by itself: there is nothing to lose).
+if ($Update -and -not $SkipContainers) {
     Write-Step 'Checking database migrations'
     # Exit 3 means Postgres isn't accepting connections yet (slow after a reboot or
     # `podman machine start`): retry for up to 90 s rather than let the backend migrate later
@@ -287,13 +316,19 @@ if (-not $SkipContainers) {
         Start-Sleep -Seconds 3
     }
     switch ($migExit) {
-        0  { }
+        0  { Write-Step 'Database is up to date' }
         10 {
             Write-Step 'Migrations pending - taking a backup first (data\backups)'
             try { & "$root\scripts\backup.ps1" -OutDir "$root\data\backups" }
             catch { throw 'Backup failed - not starting, so the database is never migrated without a backup.' + " $($_.Exception.Message)" }
+            Write-Step 'Applying migrations'
+            Invoke-Native { & "$root\.venv\Scripts\python.exe" -m backend.db.migrate up }
+            if ($LASTEXITCODE -ne 0) {
+                throw "Migrating failed - see the message above. The failed migration was rolled back; the backup just taken is in $root\data\backups (restore it with scripts\restore.ps1)."
+            }
         }
-        1  { throw 'Not starting: the migration files are invalid: see the message above.' }
+        # Exit 1 is also any Python error (a missing package after a failed pip install, ...), not only a bad file.
+        1  { throw 'Not starting: the migration files are invalid, or the backend cannot load: see the message above.' }
         2  { throw 'The database is newer than this version of Bee With Me. Update the app (git pull) instead of starting an older one.' }
         default { throw "Could not check database migrations (database not reachable?) - not starting, so the database is never migrated without a backup. Check: $engine compose -f docker\docker-compose.yaml -p bee-with-me logs" }
     }
@@ -314,11 +349,29 @@ $nodeVersion = [version]((node -v).TrimStart('v'))
 if ($nodeVersion -lt [version]'22.12.0') {
     throw "Node.js $nodeVersion is too old (need 22.12+). Install Node.js 24 LTS and re-run."
 }
-if (-not (Test-Path "$root\frontend\node_modules")) {
-    Write-Step 'Installing frontend dependencies (first run only - this can take a minute)'
+# npm, like pip, only runs on an update and only when package-lock.json changed since the last install.
+$lock      = "$root\frontend\package-lock.json"
+$lockStamp = "$root\frontend\node_modules\.package-lock.sha256"
+$lockHash  = (Get-FileHash -Algorithm SHA256 -LiteralPath $lock).Hash.ToLowerInvariant()
+$haveModules = Test-Path "$root\frontend\node_modules"
+if (-not $Update) {
+    if (-not $haveModules) {
+        throw "The frontend is not installed yet ($root\frontend\node_modules is missing). Run update.ps1 once (it needs the internet for the dependencies):`n  powershell -ExecutionPolicy Bypass -File `"$root\update.ps1`""
+    }
+} elseif ($haveModules -and (Test-Path -LiteralPath $lockStamp) -and ((Get-Content -LiteralPath $lockStamp -Raw).Trim() -eq $lockHash)) {
+    Write-Step 'Frontend dependencies up to date (package-lock.json unchanged)'
+} else {
+    Write-Step 'Installing frontend dependencies (package-lock.json is new or changed - this can take a minute)'
     Push-Location "$root\frontend"
-    npm install
+    Invoke-Native { npm install }
+    $npmExit = $LASTEXITCODE
     Pop-Location
+    if ($npmExit -ne 0) {
+        if (-not $haveModules) { throw "npm install failed (exit $npmExit; offline?) and there are no frontend dependencies yet - connect to the internet and run update.ps1 again." }
+        Write-Warn "npm install failed (exit $npmExit; offline?) - continuing with the packages already in node_modules."
+    } else {
+        Set-Content -LiteralPath $lockStamp -Value $lockHash -Encoding ascii
+    }
 }
 
 # -- Backend (own window) ------------------------------------------------------

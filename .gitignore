@@ -10,6 +10,7 @@
 *.rej
 *~
 *.DS_Store
+._*
 *.o
 *.swp
 *.log

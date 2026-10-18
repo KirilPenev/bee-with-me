@@ -277,7 +277,10 @@ async def test_startup_refusal_says_nothing_changed_and_how_to_back_up(monkeypat
 
     async def refuse(conn):
         raise m.BackupRequiredError('Not applying pending migration(s) 0002: they need a backup')
+    async def nothing_pending(conn):   # the boot pre-check lets it through; the runner's own guard refuses
+        return m.Status(applied=[], pending=[], unknown=[], changed=[])
     monkeypatch.setattr(main, 'get_pool', lambda: _Pool(object()))
+    monkeypatch.setattr(main, 'status', nothing_pending)
     monkeypatch.setattr(main, 'migrate', refuse)
     with caplog.at_level(logging.CRITICAL), pytest.raises(m.BackupRequiredError):
         await main._run_migrations()

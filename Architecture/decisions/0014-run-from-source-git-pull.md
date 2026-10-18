@@ -4,7 +4,8 @@ Date: 2026-10-03
 
 ## Status
 
-Proposed
+Proposed. What follows a `git pull` is partly superseded by [ADR 20](0020-offline-start-separate-update.md):
+run the update script, not the start script.
 
 **TOGAF Phase:** D (Technology Architecture)
 **Decision Maker(s):** Project owner (kvelev)

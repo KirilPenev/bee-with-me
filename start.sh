@@ -10,17 +10,24 @@
 # with [backend] / [frontend]) rather than in new windows - there is no terminal
 # emulator that is guaranteed to exist on every distro. Ctrl+C stops both.
 #
-#   ./start.sh [--project-path DIR] [--skip-containers] [--no-browser]
+# A normal start needs no internet and never changes the database schema. After new code arrives
+# (git pull, or a copy from a USB stick) run ./update.sh instead: it installs changed dependencies,
+# backs the database up, applies new migrations, then starts the app. The first run on a new
+# machine is also ./update.sh (it needs the internet once for the dependencies).
+#
+#   ./start.sh [--project-path DIR] [--skip-containers] [--no-browser] [--update]
 #
 #   --project-path DIR  Path to the project folder (default: this script's folder).
 #   --skip-containers  Don't start the database container (database already running). --skip-docker still works.
 #   --no-browser        Don't auto-open the frontend once it's up.
+#   --update            What ./update.sh runs: also install changed dependencies and back up + migrate the database.
 
 set -euo pipefail
 
 PROJECT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKIP_CONTAINERS=0
 NO_BROWSER=0
+UPDATE=0
 
 step() { printf '\033[36m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[33m%s\033[0m\n' "$*"; }
@@ -31,7 +38,8 @@ while [[ $# -gt 0 ]]; do
         --project-path) [[ $# -ge 2 ]] || die '--project-path needs a value'; PROJECT_PATH="$2"; shift 2 ;;
         --skip-containers|--skip-docker) SKIP_CONTAINERS=1; shift ;;
         --no-browser)   NO_BROWSER=1; shift ;;
-        -h|--help)      sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --update)       UPDATE=1; shift ;;
+        -h|--help)      sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)              die "Unknown option: $1 (see --help)" ;;
     esac
 done
@@ -261,7 +269,11 @@ Otherwise stop that app (or move one of them to another port) and start again."
     fi
 fi
 
-# -- Python venv + backend deps ---------------------------------------------------
+# -- Python venv + backend deps (update only) --------------------------------------
+if [[ $UPDATE -eq 0 && ! -x "$ROOT/.venv/bin/python" ]]; then
+    die "The backend is not installed yet ($ROOT/.venv is missing). Run ./update.sh once (it needs the internet for the dependencies):
+  \"$ROOT/update.sh\""
+fi
 if [[ ! -x "$ROOT/.venv/bin/python" ]]; then
     step 'Creating Python virtual environment (.venv)'
     PY="$(command -v python3 || command -v python || true)"
@@ -270,14 +282,35 @@ if [[ ! -x "$ROOT/.venv/bin/python" ]]; then
         || die "Failed to create the virtual environment at $ROOT/.venv. On Debian/Ubuntu the venv module is a separate package: sudo apt install python3-venv"
 fi
 
-step 'Installing/checking backend dependencies'
-if ! "$ROOT/.venv/bin/python" -m pip install -q -r "$ROOT/backend/requirements.txt"; then
-    # Offline laptops still start with what is installed; a missing package shows up when the backend starts.
-    warn 'pip install failed (offline?) - continuing with the packages already in .venv.'
+# SHA-256 of file $1 (empty when it cannot be read): through the venv's Python, so no sha256sum/shasum is needed.
+file_sha256() {
+    "$ROOT/.venv/bin/python" -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1" 2>/dev/null || true
+}
+
+# pip only runs when requirements.txt is new or changed since the last successful install: an update
+# copied from a USB stick has to work offline, and pip needs the network even when everything is
+# installed already. The stamp is written only after a successful install, so a failed one is retried.
+REQ="$ROOT/backend/requirements.txt"
+REQ_STAMP="$ROOT/.venv/.requirements.sha256"
+REQ_HASH="$(file_sha256 "$REQ")"
+if [[ $UPDATE -eq 0 ]]; then
+    :   # a normal start installs nothing
+elif [[ -n "$REQ_HASH" && -f "$REQ_STAMP" && "$(cat "$REQ_STAMP")" == "$REQ_HASH" ]]; then
+    step 'Backend dependencies up to date (requirements.txt unchanged)'
+else
+    step 'Installing backend dependencies (requirements.txt is new or changed)'
+    if ! "$ROOT/.venv/bin/python" -m pip install -q --disable-pip-version-check --retries 1 --timeout 10 -r "$REQ"; then
+        # Offline laptops still start with what is installed; a missing package shows up when the backend starts.
+        warn 'pip install failed (offline?) - continuing with the packages already in .venv.'
+    elif [[ -n "$REQ_HASH" ]]; then
+        printf '%s\n' "$REQ_HASH" > "$REQ_STAMP"
+    fi
 fi
 
-# -- Database migrations: back up first if any are pending ---------------------------
-if [[ $SKIP_CONTAINERS -eq 0 ]]; then
+# -- Database migrations (update only): back up first, then migrate ------------------
+# A normal start leaves the schema alone; the backend refuses to start on pending migrations and names
+# update.sh (a fresh, empty database it migrates by itself: there is nothing to lose).
+if [[ $UPDATE -eq 1 && $SKIP_CONTAINERS -eq 0 ]]; then
     step 'Checking database migrations'
     # Exit 3 means Postgres isn't accepting connections yet (slow after a reboot or
     # `podman machine start`): retry for up to 90 s rather than let the backend migrate later
@@ -295,11 +328,15 @@ if [[ $SKIP_CONTAINERS -eq 0 ]]; then
         sleep 3
     done
     case "$mig" in
-        0)  ;;
+        0)  step 'Database is up to date' ;;
         10) step 'Migrations pending - taking a backup first (data/backups)'
             "$ROOT/scripts/backup.sh" "$ROOT/data/backups" \
-                || die 'Backup failed - not starting, so the database is never migrated without a backup.' ;;
-        1)  die 'Not starting: the migration files are invalid: see the message above.' ;;
+                || die 'Backup failed - not starting, so the database is never migrated without a backup.'
+            step 'Applying migrations'
+            ( cd "$ROOT" && "$ROOT/.venv/bin/python" -m backend.db.migrate up ) \
+                || die "Migrating failed - see the message above. The failed migration was rolled back; the backup just taken is in $ROOT/data/backups (restore it with scripts/restore.sh)." ;;
+        # Exit 1 is also any Python error (a missing package after a failed pip install, ...), not only a bad file.
+        1)  die 'Not starting: the migration files are invalid, or the backend cannot load: see the message above.' ;;
         2)  die 'The database is newer than this version of Bee With Me. Update the app (git pull) instead of starting an older one.' ;;
         *)  die "Could not check database migrations (database not reachable?) - not starting, so the database is never migrated without a backup. Check: $ENGINE compose -f docker/docker-compose.yaml -p bee-with-me logs" ;;
     esac
@@ -317,9 +354,24 @@ command -v npm >/dev/null 2>&1 || die 'npm was not found on PATH. Install Node.j
 # Floor matches "engines" in frontend/package.json; .npmrc engine-strict enforces it for npm too.
 node -e 'const [a, b] = process.versions.node.split(".").map(Number); process.exit(a > 22 || (a === 22 && b >= 12) ? 0 : 1)' \
     || die "Node.js $(node -v) is too old (need 22.12+). Install Node.js 24 LTS and re-run."
-if [[ ! -d "$ROOT/frontend/node_modules" ]]; then
-    step 'Installing frontend dependencies (first run only - this can take a minute)'
-    (cd "$ROOT/frontend" && npm install)
+# npm, like pip, only runs on an update and only when package-lock.json changed since the last install.
+LOCK_STAMP="$ROOT/frontend/node_modules/.package-lock.sha256"
+LOCK_HASH="$(file_sha256 "$ROOT/frontend/package-lock.json")"
+if [[ $UPDATE -eq 0 ]]; then
+    [[ -d "$ROOT/frontend/node_modules" ]] \
+        || die "The frontend is not installed yet ($ROOT/frontend/node_modules is missing). Run ./update.sh once (it needs the internet for the dependencies):
+  \"$ROOT/update.sh\""
+elif [[ -d "$ROOT/frontend/node_modules" && -n "$LOCK_HASH" && -f "$LOCK_STAMP" && "$(cat "$LOCK_STAMP")" == "$LOCK_HASH" ]]; then
+    step 'Frontend dependencies up to date (package-lock.json unchanged)'
+else
+    step 'Installing frontend dependencies (package-lock.json is new or changed - this can take a minute)'
+    if (cd "$ROOT/frontend" && npm install); then
+        [[ -n "$LOCK_HASH" ]] && printf '%s\n' "$LOCK_HASH" > "$LOCK_STAMP"
+    elif [[ -d "$ROOT/frontend/node_modules" ]]; then
+        warn 'npm install failed (offline?) - continuing with the packages already in node_modules.'
+    else
+        die 'npm install failed (offline?) and there are no frontend dependencies yet - connect to the internet and run ./update.sh again.'
+    fi
 fi
 
 # -- USB HID gateway permissions ---------------------------------------------------

@@ -4,7 +4,8 @@ Date: 2026-10-03
 
 ## Status
 
-Proposed (implemented in EFFIS P0 on `feature/effis-fire-layers`)
+Proposed (implemented in EFFIS P0 on `feature/effis-fire-layers`). When migrations run is partly superseded by
+[ADR 20](0020-offline-start-separate-update.md): the update script backs up and migrates; start never does.
 
 **TOGAF Phase:** C (Data Architecture)
 **Decision Maker(s):** Project owner (kvelev)

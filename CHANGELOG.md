@@ -1,5 +1,106 @@
 # Changelog
 
+## [Unreleased]
+
+### Start works offline; updating is a separate step
+
+`start.ps1` / `start.bat` / `./start.sh` no longer install anything or touch the database schema, so an
+everyday start never needs the internet (before, every start ran `pip install`, which hangs offline).
+After new code arrives (`git pull` or a USB copy), and on the first install, run **`update.ps1` /
+`update.bat` / `./update.sh`**: it installs only the dependencies whose lock file changed, backs the
+database up, applies new migrations and starts the app. Starting new code without updating stops with
+`DATABASE NEEDS UPDATING` instead of migrating behind your back. A fresh, empty database is still
+migrated by the backend by itself. See ADR 20.
+
+### Fixed: start refused on folders copied from a Mac
+
+macOS leaves hidden `._<name>` files next to every file it copies to a FAT/exFAT stick or an SMB share; the
+migration runner took `._0001_baseline.sql` for a badly named migration and refused to start. Hidden files
+are now ignored.
+
+### Serial numbers are unique per device type
+
+Bees and repeaters number their serials independently, so bee 10 and repeater 10 can now both be
+registered (migration 0006 replaces `UNIQUE (dev_sn)` with `UNIQUE (dev_sn, device_type)`). A Cmd=30
+frame only matches a registered **bee**, a Cmd=20 frame only a **repeater**; the "Unknown or inactive"
+log line now names which kind was looked for. The device type can no longer be changed in the edit form
+(it was silently ignored before).
+
+### Set repeater location
+
+Repeaters have no GNSS, so admins can now place them by hand from the map toolbar, like HQ:
+**Set repeater location**, pick the repeater, click the map. Placed repeaters show for everyone as a
+cyan triangle (grey when the device is inactive). Stored on `devices.site_latitude`/`site_longitude`
+(migration 0007, repeaters only), set through `PUT /api/devices/{id}/location`.
+
+## [1.7.2] - 2026-10-10
+
+### Test mode in Settings
+
+Admins can start and stop a demo simulation from **Settings → Test mode**: the in-server
+version of `tools/demo.py`. It adds 6 demo volunteers with trackers (one always in SOS) and two
+teams, then moves them around a chosen start point every few seconds. The card only appears when
+the backend runs with `ENABLE_TEST_ENDPOINTS=true`, so field laptops never show it. Unlike the
+CLI script, the demo volunteers get an unusable random password. A backend restart stops test mode.
+
+### Test mode scenarios
+
+Test mode can now exercise every tracker state: up to 12 trackers (6 personas with photos and teams,
+up to 6 extras without), and how many are in SOS, without a GPS fix, stale, lost or on low battery,
+plus the step per update and the start area. **Reset demo data** stops test mode and deletes the
+demo trackers' positions and SOS alerts, so the next tester starts with an empty map.
+Simulated trackers report at most once a minute, like real ones: the interval is 60–600 s
+(default 60) in Settings → Test mode, the API, and `tools/demo.py --interval`.
+
+### Offline maps moved to Settings
+
+The BG Mountains download and the online/offline choice moved from the About page to Settings →
+Offline maps. Until someone picks online or offline, the browser now uses offline tiles only if the
+server has downloaded them (`available` in `GET /api/tiles/bgmountains/status`); before, it always
+assumed offline, so a server without a download showed an empty BG Mountains map.
+
+### `INITIAL_ADMIN_PASSWORD`
+
+Sets the password of the `admin` account created on an empty database. Unset, it stays `admin`
+as before, so field laptops are unaffected; any internet-facing install must set it.
+
+### Weather through the backend
+
+The OpenWeatherMap key no longer ships in the browser bundle (R-05). The backend proxies the
+weather tiles, current conditions and box/city wind (`/api/weather/*`, login required) and adds
+the key itself. Rename `VITE_OWM_API_KEY` to `OWM_API_KEY` in `.env` when convenient; the old
+name keeps working.
+
+### Develop environment and branching
+
+Feature branches now merge into `develop` through PRs; every merge is deployed to the
+develop environment (see `CONTRIBUTING.md` and `deploy/`). Releases go
+`release/X.Y.Z` → `main` with a merge commit. A pre-commit hook (`.githooks/`) runs the fast test
+suites for the files being committed.
+
+### Node.js 20 retired
+
+Node 20 reached end of life on 2026-04-30. The frontend now requires **Node.js 22.12+**, with
+**24 LTS** the recommended version (`frontend/.nvmrc`). It is enforced in three places so a field
+laptop on an old Node fails at startup with a clear message, not halfway through an operation:
+`engines` in `frontend/package.json`, `engine-strict=true` in `frontend/.npmrc`, and a version
+check in `start.sh` / `start.ps1`. No code or dependency changes were needed.
+
+**Upgrading a field laptop:** install Node.js 24 LTS, delete `frontend/node_modules`, run
+`npm ci` in `frontend/`.
+
+### Frontend toolchain: `npm audit` clean
+
+`npm audit` reported 5 advisories (1 critical, 2 high, 2 moderate), all in build/test tooling, none
+in the shipped bundle. They still mattered: the start scripts serve the app with the Vite dev
+server, so Vite's Windows `server.fs.deny` bypass and `launch-editor` NTLM-hash leak applied to
+the field laptops.
+
+- Vite 5.4 → 8.3, `@vitejs/plugin-vue` 5 → 6, Vitest 1.6 → 5.0 (critical: Vitest UI file read,
+  unused here but fixed). esbuild is no longer used by Vite.
+- `brace-expansion` (via `@vue/test-utils`) bumped in the lockfile.
+- No source or config changes; 310 tests green on Node 22, 24 and 26.
+
 ## [1.7.1] - 2026-09-08
 
 ### Test suites green for the first time

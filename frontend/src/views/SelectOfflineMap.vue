@@ -119,8 +119,10 @@ import { useRouter } from 'vue-router'
 const { t } = useI18n()
 const router = useRouter()
 
+const HOST = import.meta.env.VITE_TILE_HOST;
+const PORT = import.meta.env.VITE_TILE_PORT;
 
-const TILE_SERVER = 'http://127.0.0.1:8080'
+const TILE_SERVER = `http://${HOST}:${PORT}`;
 
 
 const maps = ref([])

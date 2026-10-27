@@ -60,17 +60,19 @@ def _port_and_baud() -> tuple[str, int]:
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
-async def _device_row(conn: asyncpg.Connection, dev_sn: int) -> asyncpg.Record | None:
+async def _device_row(conn: asyncpg.Connection, dev_sn: int, device_type: str) -> asyncpg.Record | None:
+    # Bees and repeaters have separate serial ranges: bee 10 and repeater 10 are different devices,
+    # so the frame's Cmd decides which kind of row the DevSN may match.
     return await conn.fetchrow(
-        'SELECT id, user_id FROM devices WHERE dev_sn = $1 AND is_active = TRUE',
-        dev_sn,
+        'SELECT id, user_id FROM devices WHERE dev_sn = $1 AND device_type = $2 AND is_active = TRUE',
+        dev_sn, device_type,
     )
 
 
 async def _handle_bee(frame: BeeFrame, conn: asyncpg.Connection) -> None:
-    device = await _device_row(conn, frame.dev_sn)
+    device = await _device_row(conn, frame.dev_sn, 'bee')
     if device is None:
-        logger.warning('Unknown or inactive device dev_sn=%s — register it first', frame.dev_sn)
+        logger.warning('Unknown or inactive bee dev_sn=%s — register it first', frame.dev_sn)
         return
 
     # A frame without a GNSS fix still proves the device is powered and in radio range, and
@@ -231,8 +233,9 @@ async def _ensure_sos_alert(
 
 
 async def _handle_repeater(frame: RepeaterFrame, conn: asyncpg.Connection) -> None:
-    device = await _device_row(conn, frame.dev_sn)
+    device = await _device_row(conn, frame.dev_sn, 'repeater')
     if device is None:
+        logger.warning('Unknown or inactive repeater dev_sn=%s — register it first', frame.dev_sn)
         return
     await conn.execute(
         'INSERT INTO repeater_events (device_id, msg_id, battery_voltage) VALUES ($1, $2, $3)',

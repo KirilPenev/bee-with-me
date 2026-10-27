@@ -1,17 +1,27 @@
 import asyncio
 import logging
-from contextlib import asynccontextmanager
+import math
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .auth import hash_password
 from .config import settings
+from .version import APP_VERSION
 from .database import close_pool, get_pool, init_pool
-from .routers import auth, devices, export, groups, locations, users, ws, test, hardware_reader, tiles
+from .db.migrate import BackupRequiredError, MigrationError, UpdateRequiredError, has_user_tables, migrate, status
+from .routers import auth, devices, export, fire, groups, locations, users, ws, test, hardware_reader, tiles, weather
+from .routers import settings as settings_router
 from .ws import manager
+from .fire import poller as fire_poller
+from .fire.repository import anonymise_alerts, anonymise_hotspots, prune_fire_data
+from .fire.service import service as fire_alarm
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -46,6 +56,25 @@ async def _cleanup_old_locations() -> None:
                             deleted or 0, settings.location_retention_days)
         except Exception as exc:
             logger.warning('Location cleanup failed: %s', exc)
+        try:
+            async with get_pool().acquire() as conn:
+                anonymised = await anonymise_alerts(conn, settings.location_retention_days)
+                logger.info('Fire alert anonymisation: anonymised %d resolved alerts', anonymised)
+        except Exception as exc:
+            logger.warning('Fire alert anonymisation failed: %s', exc)
+        try:
+            async with get_pool().acquire() as conn:
+                anonymised = await anonymise_hotspots(conn, settings.location_retention_days)
+                logger.info('Fire hotspot anonymisation: anonymised %d hotspots', anonymised or 0)
+        except Exception as exc:
+            logger.warning('Fire hotspot anonymisation failed: %s', exc)
+        try:
+            async with get_pool().acquire() as conn:
+                pruned = await prune_fire_data(conn)
+                logger.info('Fire data cleanup: removed %d hotspots, %d burnt areas, %d disabled zones',
+                            pruned['fire_hotspots'], pruned['fire_burnt_areas'], pruned['fire_suppression_zones'])
+        except Exception as exc:
+            logger.warning('Fire data prune failed: %s', exc)
 
 
 def _warn_insecure_defaults() -> None:
@@ -60,6 +89,8 @@ def _warn_insecure_defaults() -> None:
         problems.append('SECRET_KEY is still the example value — JWTs can be forged. Set a long random string in .env')
     if settings.offline_maps_password in ('change_me', ''):
         problems.append('OFFLINE_MAPS_PASSWORD is unset or still the example value')
+    if settings.postgres_password in ('change_me', ''):
+        problems.append('POSTGRES_PASSWORD is unset or still the example value — set a real database password in .env')
     if settings.enable_test_endpoints:
         problems.append('ENABLE_TEST_ENDPOINTS=true — /api/test/simulate can write fabricated positions. Never enable during a real operation')
     if not problems:
@@ -70,22 +101,48 @@ def _warn_insecure_defaults() -> None:
     logger.error('=' * 72)
 
 
-async def _ensure_schema_migrations() -> None:
-    """Small, idempotent additive migrations for existing databases — schema.sql only
-    applies to a fresh volume, so anything added after go-live needs a safe upgrade path
-    here instead of requiring `docker compose down -v` (which would drop live data)."""
+async def _run_migrations() -> None:
+    """Make sure the schema matches this code before anything touches the database.
+
+    Boot only migrates when nothing can be lost: a fresh database (first start) or development data
+    (ALLOW_MIGRATE_WITHOUT_BACKUP=true). An existing database with pending migrations is left as it is
+    and the backend refuses to start: update.ps1 / update.sh back it up and migrate it, so a routine
+    start never changes the schema. Unlike the insecure-defaults check this refuses to start: running
+    on a half-migrated schema would fail in confusing ways mid-operation.
+    """
     async with get_pool().acquire() as conn:
-        await conn.execute('ALTER TABLE devices ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMPTZ')
-        await conn.execute(
-            'ALTER TABLE location_events '
-            'ADD COLUMN IF NOT EXISTS gnss_valid BOOLEAN NOT NULL DEFAULT TRUE'
-        )
-        # /live and /trail both order and filter on received_at now that freshness is judged
-        # on the server clock rather than the device's.
-        await conn.execute(
-            'CREATE INDEX IF NOT EXISTS idx_location_events_device_received '
-            'ON location_events (device_id, received_at DESC)'
-        )
+        try:
+            current = await status(conn)
+            if current.pending and not settings.allow_migrate_without_backup and await has_user_tables(conn):
+                raise UpdateRequiredError(
+                    f'This version of Bee With Me needs database migration(s) {", ".join(current.pending)}')
+            applied = await migrate(conn)
+        except UpdateRequiredError as exc:
+            logger.critical('=' * 72)
+            logger.critical('DATABASE NEEDS UPDATING: %s', exc)
+            logger.critical('Nothing was changed. Stop here and run update.ps1 (Windows) or update.sh: it backs up '
+                            'the database, migrates it, then starts the app.')
+            logger.critical('=' * 72)
+            raise
+        except BackupRequiredError as exc:
+            logger.critical('=' * 72)
+            logger.critical('NOT MIGRATING THE DATABASE: %s', exc)
+            logger.critical('Nothing was changed. Run update.ps1 / update.sh (it backs up first), or '
+                            'run scripts/backup.ps1 / scripts/backup.sh -> data/backups, then start again.')
+            logger.critical('Development data only: ALLOW_MIGRATE_WITHOUT_BACKUP=true skips this check.')
+            logger.critical('=' * 72)
+            raise
+        except MigrationError as exc:
+            logger.critical('=' * 72)
+            logger.critical('DATABASE MIGRATION FAILED: %s', exc)
+            logger.critical('The failed migration was rolled back; the database is as it was before it.')
+            logger.critical('The update script took a backup before migrating: see data/backups/.')
+            logger.critical('To go back to it: stop the backend, then run scripts/restore.ps1 (Windows) or '
+                            'scripts/restore.sh with that dump (see README, Backup and restore).')
+            logger.critical('=' * 72)
+            raise
+    if applied:
+        logger.info('Applied database migrations: %s', ', '.join(applied))
 
 
 async def _ensure_default_admin() -> None:
@@ -95,9 +152,12 @@ async def _ensure_default_admin() -> None:
             await conn.execute(
                 """INSERT INTO users (username, password_hash, full_name, role)
                    VALUES ('admin', $1, 'Administrator', 'admin')""",
-                hash_password('admin'),
+                hash_password(settings.initial_admin_password or 'admin'),
             )
-            logger.info('Default admin created — username: admin / password: admin')
+            if settings.initial_admin_password:
+                logger.info('Default admin created — username: admin / password: INITIAL_ADMIN_PASSWORD')
+            else:
+                logger.info('Default admin created — username: admin / password: admin')
 
 
 @asynccontextmanager
@@ -105,11 +165,18 @@ async def lifespan(app: FastAPI):
     _warn_insecure_defaults()
     await init_pool()
     logger.info('Database pool ready')
-    await _ensure_schema_migrations()
+    await _run_migrations()
     await _ensure_default_admin()
 
     notify_task  = asyncio.create_task(manager.listen_notifications())
     cleanup_task = asyncio.create_task(_cleanup_old_locations())
+    fire_task = asyncio.create_task(fire_poller.run())
+    fire_task.add_done_callback(lambda t: _log_task_failure(t, 'Fire poller'))
+    # Hooks only signal re-evaluation; the single alarm actor does the work and never raises into a router/poller.
+    fire_poller.after_refresh = fire_alarm.request_evaluation
+    settings_router.after_change = fire_alarm.request_evaluation
+    alarm_task = asyncio.create_task(fire_alarm.run())
+    alarm_task.add_done_callback(lambda t: _log_task_failure(t, 'Fire alarm'))
 
     # Serial (LoRaWAN) reader — runs only when a real port is available
     serial_task = None
@@ -135,14 +202,45 @@ async def lifespan(app: FastAPI):
 
     notify_task.cancel()
     cleanup_task.cancel()
+    fire_task.cancel()
+    alarm_task.cancel()
     if serial_task:
         serial_task.cancel()
     if hid_task:
         hid_task.cancel()
+    if settings.enable_test_endpoints:
+        from .simulation import simulation
+        await simulation.stop()
+    # The alarm task may hold a pooled connection mid-tick: let its cancellation finish before the pool closes.
+    with suppress(asyncio.CancelledError):
+        await alarm_task
     await close_pool()
 
 
-app = FastAPI(title='Bee With Me API', version='1.7.1', lifespan=lifespan)
+app = FastAPI(title='Bee With Me API', version=APP_VERSION, lifespan=lifespan)
+
+def _json_safe(value):
+    """Make a validation-error payload JSON encodable: a lone surrogate becomes escaped text, bytes are decoded the
+    same way, and a non-finite float (NaN, Infinity) becomes None. None of them may turn the 422 into a 500."""
+    if isinstance(value, str):
+        return value.encode('utf-8', 'backslashreplace').decode('utf-8')
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode('utf-8', 'backslashreplace')
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {_json_safe(k): _json_safe(v) for k, v in value.items()}
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    """FastAPI's default 422, but safe for input that cannot be encoded (BP-03). Never logs the body (DP-02).
+    Sanitised before and after jsonable_encoder: it decodes bytes strictly and passes NaN through."""
+    return JSONResponse(status_code=422, content={'detail': _json_safe(jsonable_encoder(_json_safe(exc.errors())))})
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -158,12 +256,15 @@ app.include_router(groups.router)
 app.include_router(devices.router)
 app.include_router(locations.router)
 app.include_router(export.router)
+app.include_router(fire.router)
+app.include_router(settings_router.router)
 app.include_router(ws.router)
 if settings.enable_test_endpoints:
     app.include_router(test.router)
     logger.warning('Test/simulation endpoints ENABLED — /api/test/simulate writes fabricated positions')
 app.include_router(hardware_reader.router)
 app.include_router(tiles.router)
+app.include_router(weather.router)
 
 
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)

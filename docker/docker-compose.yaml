@@ -1,3 +1,6 @@
+# Fixed project name: the scripts find the db container by this label, whatever the folder is called.
+name: bee-with-me
+
 services:
   db:
     image: postgis/postgis:16-3.4
@@ -7,10 +10,11 @@ services:
     restart: unless-stopped
     env_file: ../.env
     volumes:
-      - ../backend/db/schema.sql:/docker-entrypoint-initdb.d/schema.sql
       - ../data/pgdata:/var/lib/postgresql/data
+    # Loopback only: the backend, the hardware reader and the scripts all run on this machine.
+    # To reach the database from another machine, change this binding deliberately.
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
 
   tiles:
     image: maptiler/tileserver-gl:latest
@@ -18,5 +22,5 @@ services:
     volumes:
       - ../tiles:/data
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     command: --no-config --port 8080

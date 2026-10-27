@@ -38,6 +38,7 @@ export const getDevices    = ()             => api.get('/devices/')
 export const createDevice  = (data)         => api.post('/devices/', data)
 export const updateDevice  = (id, data)     => api.put(`/devices/${id}`, data)
 export const assignDevice  = (id, userId)   => api.put(`/devices/${id}/assign`, { user_id: userId })
+export const setDeviceLocation = (id, lat, lon) => api.put(`/devices/${id}/location`, { latitude: lat, longitude: lon })
 export const deleteDevice      = (id) => api.delete(`/devices/${id}`)
 export const reactivateDevice  = (id) => api.post(`/devices/${id}/reactivate`)
 export const permanentDeleteDevice = (id) => api.delete(`/devices/${id}/permanent`)
@@ -60,3 +61,52 @@ export const getTileStatus      = () => api.get('/tiles/bgmountains/status')
 export const exportCSV     = (params) => api.get('/export/csv',     { params, responseType: 'blob' })
 export const exportGeoJSON = (params) => api.get('/export/geojson', { params, responseType: 'blob' })
 export const exportPDF     = (params) => api.get('/export/pdf',     { params, responseType: 'blob' })
+
+// Fire (EFFIS / GWIS)
+export const getFireHotspots   = () => api.get('/fire/hotspots')
+export const getFireBurntAreas = () => api.get('/fire/burnt-areas')
+export const getFireStatus     = () => api.get('/fire/status')
+// The backend defaults to 50 rows; every open alert must reach the banner, so ask for the maximum.
+// Resolves with the array; `.total` (non-enumerable) is the server's X-Total-Count, so the banner
+// can say when more alerts exist than were returned.
+export const getFireAlerts = async (params) => {
+  const res = await api.get('/fire/alerts', { params: { limit: 500, ...params }, fullResponse: true })
+  const list = Array.isArray(res.data) ? res.data : []
+  const total = Number.parseInt(res.headers?.['x-total-count'], 10)
+  Object.defineProperty(list, 'total', { value: Number.isFinite(total) ? total : list.length })
+  return list
+}
+export const acknowledgeFireAlert     = (id)  => api.post(`/fire/alerts/${id}/acknowledge`)
+// Only the ids the operator could see: an alert that arrived meanwhile stays unacknowledged.
+export const acknowledgeAllFireAlerts = (ids) => api.post('/fire/alerts/acknowledge-all', { alert_ids: ids })
+
+// Settings (HQ + fire alarm)
+export const getSettings  = ()     => api.get('/settings')
+export const putSettings  = (body) => api.put('/settings', body)
+export const putHQ        = (body) => api.put('/settings/hq', body)
+export const putHQInitial = (body) => api.put('/settings/hq-initial', body)
+
+// Weather: OpenWeatherMap through the backend, which holds the key (routers/weather.py)
+export const getWeatherCurrent = (lat, lon)   => api.get('/weather/current', { params: { lat, lon } })
+export const getWeatherBox     = (bbox, zoom) => api.get('/weather/box', { params: { bbox, zoom } })
+export const getWeatherTile    = (src)        => api.get(src.replace(/^\/api/, ''), { responseType: 'blob' })
+
+// Test mode (only when the server runs with ENABLE_TEST_ENDPOINTS=true; 404 otherwise)
+export const getSimulation   = ()     => api.get('/test/simulation')
+export const startSimulation = (body) => api.post('/test/simulation/start', body)
+export const stopSimulation  = ()     => api.post('/test/simulation/stop')
+export const resetSimulation = ()     => api.post('/test/simulation/reset')
+
+// Fire: operator writes. Notes are free operator text; they travel only in these bodies.
+export const dismissFireHotspot     = (id, notes) => api.post(`/fire/hotspots/${id}/dismiss`, { notes: notes ?? null })
+export const createFieldReport      = (body)      => api.post('/fire/field-reports', body)
+export const extinguishFieldReport  = (id)        => api.post(`/fire/field-reports/${id}/extinguish`)
+export const getSuppressionZones    = (params)    => api.get('/fire/suppression-zones', { params })
+export const createSuppressionZone  = (body)      => api.post('/fire/suppression-zones', body)
+export const updateSuppressionZone  = (id, body)  => api.put(`/fire/suppression-zones/${id}`, body)
+// Activation is explicit and carries the version the operator saw (B51/B52): a changed zone answers 409 zone_stale.
+// A disabled zone is removed by the server 48 h later.
+export const disableSuppressionZone = (id, expectedUpdatedAt) =>
+  api.post(`/fire/suppression-zones/${id}/disable`, { expected_updated_at: expectedUpdatedAt })
+export const enableSuppressionZone  = (id, expectedUpdatedAt) =>
+  api.post(`/fire/suppression-zones/${id}/enable`, { expected_updated_at: expectedUpdatedAt })

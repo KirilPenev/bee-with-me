@@ -1,12 +1,17 @@
-from typing import Annotated
+import logging
+from typing import Annotated, Literal
 from uuid import UUID
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 from ..auth import get_current_user, require_role
 from ..database import get_conn
+from ..fire import repository as fire_repository
+from ..fire.service import ALARM_LOCK_KEY, notify as fire_notify, notify_alerts_updated
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix='/api/devices', tags=['devices'])
 
@@ -14,7 +19,7 @@ router = APIRouter(prefix='/api/devices', tags=['devices'])
 class DeviceCreate(BaseModel):
     dev_sn: int
     name: str | None = None
-    device_type: str = 'bee'
+    device_type: Literal['bee', 'repeater'] = 'bee'
     user_id: UUID | None = None
 
 
@@ -28,6 +33,18 @@ class AssignRequest(BaseModel):
     user_id: UUID | None   # None = detach
 
 
+class LocationPatch(BaseModel):
+    """PUT /api/devices/{id}/location: both numbers (set) or both null (clear), like HQ."""
+    latitude:  Annotated[float, Field(strict=True, ge=-90, le=90)] | None
+    longitude: Annotated[float, Field(strict=True, ge=-180, le=180)] | None
+
+    @model_validator(mode='after')
+    def _both_or_neither(self):
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError('latitude and longitude must both be set or both be empty')
+        return self
+
+
 @router.get('/')
 async def list_devices(
     conn: Annotated[asyncpg.Connection, Depends(get_conn)],
@@ -35,10 +52,11 @@ async def list_devices(
 ):
     rows = await conn.fetch("""
         SELECT d.id, d.dev_sn, d.name, d.device_type, d.is_active, d.created_at,
+               d.site_latitude, d.site_longitude,
                u.id AS user_id, u.full_name AS user_name, u.rank AS user_rank
         FROM devices d
         LEFT JOIN users u ON u.id = d.user_id
-        ORDER BY d.dev_sn
+        ORDER BY d.device_type, d.dev_sn
     """)
     return [dict(r) for r in rows]
 
@@ -56,7 +74,7 @@ async def create_device(
             RETURNING id, dev_sn, name, device_type
         """, body.dev_sn, body.name, body.device_type, body.user_id)
     except asyncpg.UniqueViolationError:
-        raise HTTPException(status_code=409, detail='dev_sn already registered')
+        raise HTTPException(status_code=409, detail=f'A {body.device_type} with dev_sn {body.dev_sn} is already registered')
     return dict(row)
 
 
@@ -82,7 +100,7 @@ async def update_device(
     device_id: UUID,
     body: DeviceUpdate,
     conn: Annotated[asyncpg.Connection, Depends(get_conn)],
-    _: Annotated[asyncpg.Record, Depends(require_role('admin'))],
+    user: Annotated[asyncpg.Record, Depends(require_role('admin'))],
 ):
     updates = body.model_dump(exclude_none=True)
     if not updates:
@@ -94,12 +112,17 @@ async def update_device(
         # value is actually changing, so repeat saves with the same user_id are a no-op.
         idx = list(updates.keys()).index('user_id') + 2
         fields += f', assigned_at = CASE WHEN user_id IS DISTINCT FROM ${idx} THEN NOW() ELSE assigned_at END'
-    row = await conn.fetchrow(
-        f'UPDATE devices SET {fields} WHERE id = $1 RETURNING id, dev_sn, name, is_active',
-        device_id, *updates.values(),
-    )
-    if row is None:
-        raise HTTPException(status_code=404, detail='Device not found')
+    async with conn.transaction():
+        row = await conn.fetchrow(
+            f'UPDATE devices SET {fields} WHERE id = $1 RETURNING id, dev_sn, name, is_active',
+            device_id, *updates.values(),
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail='Device not found')
+        # Deactivating through this edit ends the device's open rescuer alerts too, like the DELETE below.
+        resolved = (await fire_repository.resolve_disabled_alerts(conn, user['id'], device_id=device_id)
+                    if updates.get('is_active') is False else [])
+    await notify_alerts_updated(conn, resolved)
     return dict(row)
 
 
@@ -125,13 +148,43 @@ async def assign_device(
     return {'device_id': str(device_id), 'user_id': str(body.user_id) if body.user_id else None}
 
 
+@router.put('/{device_id}/location')
+async def set_device_location(
+    device_id: UUID,
+    body: LocationPatch,
+    conn: Annotated[asyncpg.Connection, Depends(get_conn)],
+    user: Annotated[asyncpg.Record, Depends(require_role('admin'))],
+):
+    """Place or clear a repeater on the map. Repeaters have no GNSS, so this hand-set point is the only
+    position they have; bees report their own and are refused here."""
+    row = await conn.fetchrow(
+        """UPDATE devices SET site_latitude = $2, site_longitude = $3
+           WHERE id = $1 AND device_type = 'repeater'
+           RETURNING id, dev_sn, name, device_type, site_latitude, site_longitude""",
+        device_id, body.latitude, body.longitude,
+    )
+    if row is None:
+        if await conn.fetchval('SELECT 1 FROM devices WHERE id = $1', device_id):
+            raise HTTPException(status_code=422,
+                                detail='Only a repeater has a hand-set location')
+        raise HTTPException(status_code=404, detail='Device not found')
+    logger.info('Repeater dev_sn=%s location %s by user %s',
+                row['dev_sn'], 'cleared' if body.latitude is None else 'set', user['id'])
+    return dict(row)
+
+
 @router.delete('/{device_id}', status_code=status.HTTP_204_NO_CONTENT)
 async def deactivate_device(
     device_id: UUID,
     conn: Annotated[asyncpg.Connection, Depends(get_conn)],
-    _: Annotated[asyncpg.Record, Depends(require_role('admin'))],
+    user: Annotated[asyncpg.Record, Depends(require_role('admin'))],
 ):
-    await conn.execute('UPDATE devices SET is_active = FALSE WHERE id = $1', device_id)
+    async with conn.transaction():
+        await conn.execute('UPDATE devices SET is_active = FALSE WHERE id = $1', device_id)
+        # Open rescuer alerts of a deactivated device end now (not "missing data"), by this admin, in the same
+        # transaction; the broadcast follows the commit.
+        resolved = await fire_repository.resolve_disabled_alerts(conn, user['id'], device_id=device_id)
+    await notify_alerts_updated(conn, resolved)
 
 
 @router.post('/{device_id}/reactivate', status_code=status.HTTP_204_NO_CONTENT)
@@ -147,14 +200,42 @@ async def reactivate_device(
 async def delete_device_permanent(
     device_id: UUID,
     conn: Annotated[asyncpg.Connection, Depends(get_conn)],
-    _: Annotated[asyncpg.Record, Depends(require_role('admin'))],
+    user: Annotated[asyncpg.Record, Depends(require_role('admin'))],
 ):
-    async with conn.transaction():
-        await conn.execute('DELETE FROM sos_alerts       WHERE device_id = $1', device_id)
-        await conn.execute('DELETE FROM location_events  WHERE device_id = $1', device_id)
-        await conn.execute('DELETE FROM repeater_events  WHERE device_id = $1', device_id)
-        deleted = await conn.fetchval(
-            'DELETE FROM devices WHERE id = $1 RETURNING id', device_id
-        )
-    if deleted is None:
-        raise HTTPException(status_code=404, detail='Device not found')
+    try:
+        async with conn.transaction():
+            # The long deletes run WITHOUT the alarm lock, so alarm ticks are not skipped while they run (BP-02, TP-02).
+            await conn.execute('DELETE FROM sos_alerts       WHERE device_id = $1', device_id)
+            await conn.execute('DELETE FROM location_events  WHERE device_id = $1', device_id)
+            await conn.execute('DELETE FROM repeater_events  WHERE device_id = $1', device_id)
+            # Serialise with the alarm tick (it holds the same lock while evaluating): a tick inserting an alert for
+            # this device must not interleave with the resolve + delete below, or the FK SET NULL leaves an open
+            # alert without a device. Blocking on purpose (the tick itself only try-locks) but bounded: after 10 s
+            # the whole delete rolls back with 503 instead of queueing behind a stuck tick. An xact lock may be
+            # taken mid-transaction; it is held to commit.
+            await conn.execute("SET LOCAL lock_timeout = '10s'")
+            await conn.execute('SELECT pg_advisory_xact_lock($1)', ALARM_LOCK_KEY)
+            # Open fire alerts for this device end now, with a reason (BP-02); resolved rows keep the history
+            # (device_id -> NULL through the FK). Must run before the delete so none is left open and orphaned.
+            resolved = await conn.fetch(
+                "UPDATE fire_alerts SET resolved_at = NOW(), resolve_reason = 'disabled', "
+                "resolved_by = $2::uuid WHERE device_id = $1 AND resolved_at IS NULL RETURNING id::text",
+                device_id, user['id'],
+            )
+            deleted = await conn.fetchval(
+                'DELETE FROM devices WHERE id = $1 RETURNING id', device_id
+            )
+            if deleted is None:
+                # unknown device: nothing was deleted, so do not resolve anything either
+                raise HTTPException(status_code=404, detail='Device not found')
+    except asyncpg.exceptions.LockNotAvailableError:
+        logger.warning('Device delete rolled back: the fire alarm lock was not available in time')
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail='The fire alarm is busy evaluating; nothing was deleted, try again in a moment')
+    for row in resolved:
+        try:
+            out = await fire_repository.get_alert_out(conn, row['id'])
+            if out is not None:
+                await fire_notify(conn, 'fire_alert_updated', out.model_dump(mode='json'))
+        except Exception:
+            logger.warning('fire alert %s resolved but its update was not broadcast', row['id'], exc_info=True)

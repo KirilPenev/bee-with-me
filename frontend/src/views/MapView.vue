@@ -47,12 +47,48 @@
       <button :class="['bm-btn', { active: measureOn }]" @click="toggleMeasure">
         {{ t('map.measure') }}
       </button>
-      <button :class="['bm-btn', { active: hqMode }]" @click="toggleHQMode">
+      <button v-if="isAdmin" :class="['bm-btn', { active: hqMode }]" :disabled="!settingsReady" @click="toggleHQMode">
         {{ hqLocation ? t('map.hqMove') : t('map.hqSet') }}
       </button>
-      <button v-if="hqLocation" class="bm-btn bm-btn-danger" @click="clearHQ">
+      <button v-if="isAdmin && hqLocation && !hqClearAsk" class="bm-btn bm-btn-danger" @click="hqClearAsk = true">
         {{ t('map.hqClear') }}
       </button>
+      <span v-if="isAdmin && hqLocation && hqClearAsk" class="bm-hq-confirm" role="alertdialog">
+        <span>{{ t('map.hqClearConfirm') }}</span>
+        <button class="bm-btn bm-btn-danger" @click="clearHQ">{{ t('map.hqClearYes') }}</button>
+        <button class="bm-btn" @click="hqClearAsk = false">{{ t('map.hqClearCancel') }}</button>
+      </span>
+      <span v-if="settingsFailed" class="bm-hq-note" role="status">
+        {{ t('map.settingsUnavailable') }}
+        <button class="bm-btn" @click="loadSettings">{{ t('map.settingsRetry') }}</button>
+      </span>
+      <span v-if="hqError" class="bm-hq-error" role="alert">{{ t('map.hqSaveFailed') }}</span>
+      <button v-if="isAdmin && repeaters.length" :class="['bm-btn', { active: repeaterMode }]" @click="toggleRepeaterMode">
+        {{ t('map.repeaterSet') }}
+      </button>
+      <span v-if="isAdmin && repeaterMode" class="bm-hq-confirm">
+        <select v-model="repeaterId" class="bm-select" :aria-label="t('map.repeaterPick')">
+          <option v-for="r in repeaters" :key="r.id" :value="r.id">
+            {{ r.name || `SN:${r.dev_sn}` }}{{ r.site_latitude != null ? ' ✓' : '' }}
+          </option>
+        </select>
+        <span>{{ t('map.repeaterHint') }}</span>
+        <button v-if="selectedRepeater?.site_latitude != null" class="bm-btn bm-btn-danger" @click="clearRepeater">
+          {{ t('map.repeaterClear') }}
+        </button>
+      </span>
+      <span v-if="repeaterError" class="bm-hq-error" role="alert">{{ t('map.repeaterSaveFailed') }}</span>
+      <button
+        v-for="name in fireLayerButtons" :key="name"
+        :class="['bm-btn', { active: fireStore.layers[name] }]"
+        :aria-pressed="fireStore.layers[name]"
+        :data-layer="name"
+        @click="toggleFire(name)"
+      >{{ t(`fire.layers.${name}`) }}</button>
+      <span v-if="isAdmin && fireStore.layers.zones && fireStore.zonesFailed" class="bm-hq-note" role="status">
+        {{ t('fire.zone.loadFailed') }}
+        <button class="bm-btn" @click="retryZones">{{ t('fire.zone.retry') }}</button>
+      </span>
       <template v-if="activeBasemap === 'satellite' || activeBasemap === 'offline'">
         <span class="bm-row-break" />
         <button
@@ -62,6 +98,63 @@
         >{{ t(`map.weather.${wl.id}`) }}</button>
       </template>
     </div>
+
+    <!-- Fire data freshness: always shows its age, and says so when it cannot. -->
+    <div v-if="fireDataLayerOn" class="fire-pill" :class="`fire-${firePill.kind}`" role="status">
+      <i18n-t v-if="firePill.time" keypath="fire.asOf" tag="span" class="fire-pill-main">
+        <template #time><span class="fire-time">{{ firePill.time }}</span></template>
+      </i18n-t>
+      <span v-if="firePill.note" class="fire-pill-note">{{ firePill.note }}</span>
+    </div>
+
+    <!-- Licence attribution (text only: the offline build loads nothing from the network). -->
+    <div v-if="fireDataLayerOn" class="fire-attribution">{{ t('fire.attribution') }}</div>
+
+    <!-- OpenLayers moves this element into its overlay; the popup inside is a Vue component. -->
+    <!-- "Show on map" from a fire alarm: a ring on the exact spot for a few seconds. -->
+    <div ref="focusRingEl" class="fire-focus-anchor" aria-hidden="true">
+      <div v-if="focusRingKey" :key="focusRingKey" class="fire-focus-ring" data-testid="fire-focus-ring" />
+    </div>
+    <div ref="firePopupEl" class="fire-popup-anchor">
+      <FirePopup
+        v-if="firePopup"
+        :kind="firePopup.kind"
+        :properties="firePopup.properties"
+        :lon-lat="firePopupLonLat"
+        :is-admin="isAdmin"
+        :busy="fireBusy"
+        :error-text="fireError"
+        @close="closeFirePopup"
+        @dismiss="onPopupDismiss"
+        @extinguish="onPopupExtinguish"
+        @create-zone="onPopupCreateZone"
+      />
+    </div>
+
+    <!-- Right-click / long-press on the map: the only item is "Report fire here". -->
+    <div v-if="ctxMenu" ref="ctxMenuEl" class="map-context" role="menu" :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }">
+      <button type="button" role="menuitem" class="mc-item" data-testid="report-fire-here" @click="reportFromMenu">
+        {{ t('fire.report.here') }}
+      </button>
+    </div>
+
+    <FieldReportForm
+      v-if="dialog?.kind === 'report'"
+      :target="dialog.target"
+      :busy="dialogBusy"
+      :error-text="dialogError"
+      @submit="submitReport"
+      @cancel="closeDialog"
+    />
+    <SuppressionZoneForm
+      v-if="dialog?.kind === 'zone'"
+      :latitude="dialog.latitude"
+      :longitude="dialog.longitude"
+      :busy="dialogBusy"
+      :error-text="dialogError"
+      @submit="submitZone"
+      @cancel="closeDialog"
+    />
 
     <!-- Measure readout -->
     <div v-if="measureReadout" class="measure-readout">
@@ -81,7 +174,7 @@
     </div>
 
     <!-- Tracker panel -->
-    <aside class="tracker-panel">
+    <aside ref="trackerPanelEl" class="tracker-panel">
       <div class="panel-header">
         <span>{{ t('map.trackers') }} ({{ displayList.length }})</span>
         <span v-if="store.hasSOS" class="badge badge-sos sos-pulse">SOS</span>
@@ -109,11 +202,17 @@
 
       <!-- Individual mode -->
       <template v-if="viewMode === 'individuals'">
+        <template v-for="pos in displayList" :key="pos.device_id">
         <div
-          v-for="pos in displayList" :key="pos.device_id"
           class="tracker-row"
-          :class="[`fresh-${freshnessOf(pos, nowTick)}`, { 'tracker-sos': pos.sos_active }]"
-          @click="focusDevice(pos)"
+          :class="[`fresh-${freshnessOf(pos, nowTick)}`, { 'tracker-sos': pos.sos_active, 'tracker-selected': selectedDeviceId === pos.device_id }]"
+          :data-device-id="pos.device_id"
+          tabindex="0"
+          role="button"
+          :aria-pressed="selectedDeviceId === pos.device_id"
+          @click="selectDevice(pos)"
+          @keydown.enter.self.prevent="selectDevice(pos)"
+          @keydown.space.self.prevent="selectDevice(pos)"
         >
           <div class="tracker-dot" :style="{ background: pos.groups?.[0]?.color ?? '#3b82f6' }" />
           <div class="tracker-info">
@@ -132,6 +231,12 @@
             </div>
           </div>
         </div>
+        <div v-if="selectedDeviceId === pos.device_id" class="tracker-actions">
+          <button type="button" class="tracker-report" data-testid="report-fire-row" @click="reportFromRow(pos)">
+            {{ t('fire.report.atPosition') }}
+          </button>
+        </div>
+        </template>
         <div v-if="!displayList.length" class="no-trackers">{{ t('map.noTrackers') }}</div>
       </template>
 
@@ -142,7 +247,13 @@
             <span class="group-section-dot" :style="{ background: group.color }" />
             {{ group.name }}
           </div>
-          <div v-if="group.leader" class="tracker-row tracker-leader" @click="focusDevice(group.leader)">
+          <div v-if="group.leader" class="tracker-row tracker-leader"
+               :class="{ 'tracker-selected': selectedDeviceId === group.leader.device_id }"
+               :data-device-id="group.leader.device_id" tabindex="0" role="button"
+               :aria-pressed="selectedDeviceId === group.leader.device_id"
+               @click="selectDevice(group.leader)"
+               @keydown.enter.self.prevent="selectDevice(group.leader)"
+               @keydown.space.self.prevent="selectDevice(group.leader)">
             <div class="tracker-dot" :style="{ background: group.color }" />
             <div class="tracker-info">
               <div class="tracker-name">
@@ -154,7 +265,12 @@
               {{ group.leader.battery_voltage?.toFixed(1) ?? '—' }}V
             </div>
           </div>
-          <div v-else class="no-leader">{{ t('map.noLeader') }}</div>
+          <div v-if="group.leader && selectedDeviceId === group.leader.device_id" class="tracker-actions">
+            <button type="button" class="tracker-report" data-testid="report-fire-row" @click="reportFromRow(group.leader)">
+              {{ t('fire.report.atPosition') }}
+            </button>
+          </div>
+          <div v-if="!group.leader" class="no-leader">{{ t('map.noLeader') }}</div>
         </template>
         <div v-if="!groupsWithLeaders.length" class="no-trackers">{{ t('map.noTrackers') }}</div>
       </template>
@@ -173,10 +289,19 @@
         </div>
       </div>
       <div class="weather-rows">
-        <div class="weather-row"><span class="weather-label">{{ t('map.weatherWind') }}</span><span>{{ weatherInfo.windSpeed.toFixed(1) }} m/s {{ weatherInfo.windDir }}</span></div>
+        <div class="weather-row">
+          <span class="weather-label">{{ t('map.weatherWind') }}</span>
+          <span class="weather-wind">
+            <span class="wind-arrow" :style="{ transform: `rotate(${(weatherInfo.windDeg ?? 0) + 180}deg)` }" aria-hidden="true">↑</span>
+            {{ weatherInfo.windSpeed.toFixed(1) }} m/s
+            <template v-if="weatherInfo.windDir">{{ t('map.weatherFrom', { dir: weatherInfo.windDir, deg: Math.round(weatherInfo.windDeg ?? 0) }) }}</template>
+          </span>
+        </div>
+        <div v-if="weatherInfo.windGust != null" class="weather-row"><span class="weather-label">{{ t('map.weatherGusts') }}</span><span>{{ weatherInfo.windGust.toFixed(1) }} m/s</span></div>
         <div class="weather-row"><span class="weather-label">{{ t('map.weatherHumidity') }}</span><span>{{ weatherInfo.humidity }}%</span></div>
         <div class="weather-row"><span class="weather-label">{{ t('map.weatherClouds') }}</span><span>{{ weatherInfo.clouds }}%</span></div>
         <div v-if="weatherInfo.city" class="weather-row weather-city">{{ weatherInfo.city }}</div>
+        <div v-if="weatherLayerId === 'wind_new' && windSourceLabel" class="weather-row weather-city">{{ t('map.weatherWindSource', { source: windSourceLabel }) }}</div>
       </div>
       <div v-if="activeWeatherLayer" class="weather-legend">
         <div class="legend-bar" :style="{ background: activeWeatherLayer.gradient }" />
@@ -189,29 +314,42 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, onActivated, onDeactivated, nextTick } from 'vue'
 
 defineOptions({ name: 'MapView' })
 import { useI18n } from 'vue-i18n'
 import { fromLonLat, toLonLat } from 'ol/proj'
+import Overlay from 'ol/Overlay'
 import { useLocationsStore } from '../stores/locations'
+import { useFireStore } from '../stores/fire'
+import { useAuthStore } from '../stores/auth'
+import { useSettingsStore } from '../stores/settings'
 import { useWebSocket } from '../composables/useWebSocket'
 import { useMap, BASEMAPS } from '../composables/useMap'
-import { getGroupsWithMembers, getSerialStatus } from '../api'
-import { ageMs, formatAge, freshnessOf, byUrgency } from '../lib/freshness'
+import { getDevices, getGroupsWithMembers, getSerialStatus, getWeatherBox, getWeatherCurrent, setDeviceLocation } from '../api'
+import { ageMs, contactAt, formatAge, freshnessOf, byUrgency } from '../lib/freshness'
+import { firePillState } from '../lib/fireStyle'
+import { recolorFor, tempLegendGradient } from '../lib/weatherTiles'
+import { compassFrom, windPoint, gridPoints, openMeteoUrl, parseOpenMeteo, nearestPoint } from '../lib/wind'
+import { unByKey } from 'ol/Observable'
 import SOSToast from '../components/SOSToast.vue'
+import FirePopup from '../components/FirePopup.vue'
+import FieldReportForm from '../components/FieldReportForm.vue'
+import SuppressionZoneForm from '../components/SuppressionZoneForm.vue'
+import { fireErrorKey } from '../lib/fireErrors'
 
-const OWM_KEY = import.meta.env.VITE_OWM_API_KEY ?? ''
 const WEATHER_LAYERS = [
   {
+    // Clouds and rain are recoloured from OWM's faint tiles (lib/weatherTiles.js); these legends
+    // show that output: white rising with cover from 10 %, and the 0.1 / 1 / 5 / 20 mm/h rain scale.
     id: 'clouds_new',
-    gradient: 'linear-gradient(to right, rgba(255,255,255,0.05), #aaa, #666)',
-    stops: ['0%', '50%', '100%'],
+    gradient: 'linear-gradient(to right, rgba(244,247,252,0) 0%, rgba(244,247,252,0.2) 20%, rgba(244,247,252,0.5) 60%, rgba(244,247,252,0.8) 100%)',
+    stops: ['10%', '50%', '100%'],
   },
   {
     id: 'precipitation_new',
-    gradient: 'linear-gradient(to right, #a0d8ef, #4169e1, #0000cd, #6600cc)',
-    stops: ['0', '1', '5', '20 mm/h'],
+    gradient: 'linear-gradient(to right, rgba(160,216,239,0.55), rgba(65,105,225,0.75), rgba(0,0,205,0.85), rgba(102,0,204,0.9))',
+    stops: ['0.1', '1', '5', '20 mm/h'],
   },
   {
     id: 'wind_new',
@@ -219,14 +357,18 @@ const WEATHER_LAYERS = [
     stops: ['0', '5', '15', '30 m/s'],
   },
   {
+    // Recoloured into 2 °C bands with contours (lib/weatherTiles.js); OWM's data stops at 30 °C.
     id: 'temp_new',
-    gradient: 'linear-gradient(to right, #8000ff, #0000ff, #00ccff, #00ff88, #ffff00, #ff8000, #ff0000)',
-    stops: ['-40°', '0°', '20°', '40°C'],
+    gradient: tempLegendGradient(),
+    stops: ['-20°', '5°', '30°C+'],   // evenly spaced labels on a linear −20 … 30 °C bar
   },
 ]
 
-const { t } = useI18n()
+const { t, locale } = useI18n()
 const store   = useLocationsStore()
+const fireStore = useFireStore()
+const authStore = useAuthStore()
+const settingsStore = useSettingsStore()
 const mapEl   = ref(null)
 
 const activeBasemap  = ref('osm')
@@ -292,21 +434,42 @@ const groupsWithLeaders = computed(() => {
   return Object.values(groupMap).sort((a, b) => a.name.localeCompare(b.name))
 })
 
-const HQ_STORAGE_KEY = 'bwm.hq'
-const hqLocation = ref(loadHQ())
+// HQ lives in the database (settings store); only an admin can place or clear it.
+const isAdmin    = computed(() => authStore.user?.role === 'admin')
+const hqLocation = computed(() => settingsStore.hq)
 const hqMode     = ref(false)
+const hqError    = ref(false)
+const hqClearAsk = ref(false)       // the Clear HQ confirmation is showing
+const settingsFailed = ref(false)   // settings could not be loaded: HQ is unknown, not absent
+const settingsReady  = computed(() => !!settingsStore.settings)
 
-function loadHQ() {
+async function loadSettings() {
+  settingsFailed.value = false
   try {
-    const raw = localStorage.getItem(HQ_STORAGE_KEY)
-    if (!raw) return null
-    const parsed = JSON.parse(raw)
-    if (typeof parsed?.lat !== 'number' || typeof parsed?.lon !== 'number') return null
-    return parsed
-  } catch { return null }
+    await settingsStore.fetchSettings()
+  } catch {
+    settingsFailed.value = true
+    return
+  }
+  await settingsStore.migrateLocalHQ()   // handles role and failures itself
 }
 
-const { map, setBasemap, setMGRSGrid, setLatLonGrid, setTrailVisible, setCheckpointNumbers, setMeasureMode, setWeatherLayer, refreshMarkers, setHQ, setHQPlacementMode } = useMap(
+// Only the latest call may set or clear the error: a slow failure of an earlier click must not
+// show "Could not save HQ" over a newer click that succeeded (the store already serialises the
+// writes, so the latest call also finishes last).
+let hqCall = 0
+async function saveHQ(action) {
+  const mine = ++hqCall
+  hqError.value = false
+  try {
+    await action()
+    if (mine === hqCall) hqError.value = false
+  } catch {
+    if (mine === hqCall) hqError.value = true
+  }
+}
+
+const { map, setBasemap, setMGRSGrid, setLatLonGrid, setTrailVisible, setCheckpointNumbers, setMeasureMode, setWeatherLayer, refreshMarkers, setHQ, setHQPlacementMode, setRepeaters, setRepeaterPlacementMode, onRepeaterPlaced, setBurntAreas, setHotspots, setFireLayerVisible, setFireLabels, onFireFeatureClick, setZones, onTrackerClick, onMapContextMenu } = useMap(
   mapEl,
   displayList,
   computed(() => store.trails),
@@ -314,19 +477,326 @@ const { map, setBasemap, setMGRSGrid, setLatLonGrid, setTrailVisible, setCheckpo
   (data)   => { measureReadout.value = data },
   groupsMap,
   (coords) => {
-    hqLocation.value = coords
-    localStorage.setItem(HQ_STORAGE_KEY, JSON.stringify(coords))
     hqMode.value = false
     setHQPlacementMode(false)
+    saveHQ(() => settingsStore.setHQ(coords.lat, coords.lon))
   },
+  computed(() => settingsStore.photosOnMap),
 )
 const { connect } = useWebSocket()
+
+// ── Fire layers ──────────────────────────────────────────────────────────────
+const FIRE_LAYER_BUTTONS = ['burnt', 'hotspots', 'zones']
+// Suppression zones are an admin tool: the button, the circles and the zone fetch are admin-only.
+const fireLayerButtons = computed(() => FIRE_LAYER_BUTTONS.filter(n => n !== 'zones' || isAdmin.value))
+// The freshness pill and the licence line describe EFFIS data; zones are our own and need neither.
+const fireDataLayerOn = computed(() => fireStore.layers.burnt || fireStore.layers.hotspots)
+const firePopupEl = ref(null)
+const focusRingEl = ref(null)
+const focusRingKey = ref(0)   // 0 = hidden; a new value restarts the pulse
+const FOCUS_RING_MS = 8000
+let focusOverlay = null
+let focusRingTimer = null
+const firePopup   = ref(null)   // { kind, properties, coordinate } | null
+let   fireOverlay = null
+let   fireMap = null
+
+function toggleFire(name) {
+  const on = !fireStore.layers[name]
+  setFireLayerVisible(name, on)
+  if (!on && firePopup.value && name !== 'zones' && (name === 'hotspots') === (firePopup.value.kind === 'hotspot')) closeFirePopup()
+  fireStore.setLayer(name, on).catch(() => { /* fetchFailed / zonesFailed drive the notices */ })
+}
+
+// A new report or zone must be visible where it was just made: switch its layer on if it is off.
+function ensureLayer(name) { if (!fireStore.layers[name]) toggleFire(name) }
+
+function retryZones() { fireStore.fetchZones().catch(() => { /* zonesFailed shows the note */ }) }
+
+// The overlay coordinate is in the map projection (EPSG:3857); the popup wants WGS84.
+const firePopupLonLat = computed(() => {
+  const c = firePopup.value?.coordinate
+  return Array.isArray(c) ? toLonLat(c) : null
+})
+
+function closeFirePopup() {
+  firePopup.value = null
+  fireError.value = ''
+  fireOverlay?.setPosition(undefined)
+}
+
+// ── Popup actions (admin: dismiss, create zone; anyone: extinguish a field report) ──────────
+const fireBusy  = ref(false)
+const fireError = ref('')
+
+// Only one popup action runs at a time. The server answers with the changed row; the popup then
+// shows that row (state chip, notes) instead of the copy it was opened with.
+async function runPopupAction(id, action) {
+  if (fireBusy.value) return
+  fireBusy.value = true
+  fireError.value = ''
+  try {
+    await action()
+    syncPopup(id)
+  } catch (err) {
+    if (firePopup.value?.properties?.id === id) fireError.value = t(fireErrorKey(err))
+  } finally {
+    fireBusy.value = false
+  }
+}
+
+function syncPopup(id) {
+  if (firePopup.value?.properties?.id !== id) return
+  const next = fireStore.hotspots.features.find(f => f.id === id)
+  if (next) firePopup.value = { ...firePopup.value, properties: { ...next.properties } }
+}
+
+const onPopupDismiss    = ({ id, notes }) => runPopupAction(id, () => fireStore.dismissHotspot(id, notes))
+const onPopupExtinguish = ({ id }) => runPopupAction(id, () => fireStore.extinguish(id))
+function onPopupCreateZone() {
+  const ll = firePopupLonLat.value
+  if (!ll) return
+  openDialog({ kind: 'zone', latitude: ll[1], longitude: ll[0] })
+  closeFirePopup()
+}
+
+// ── Dialogs: field report, suppression zone (one at a time) ──────────────────────────────────
+const dialog      = ref(null)   // { kind: 'report', target } | { kind: 'zone', latitude, longitude } | null
+const dialogBusy  = ref(false)
+const dialogError = ref('')
+let   dialogSeq   = 0
+
+function openDialog(next) {
+  closeContextMenu()
+  dialogSeq++
+  dialogBusy.value = false
+  dialogError.value = ''
+  dialog.value = next
+}
+function closeDialog() {
+  dialogSeq++
+  dialog.value = null
+  dialogBusy.value = false
+  dialogError.value = ''
+}
+
+// Runs a write for the open dialog. A dialog that was closed or replaced while the request was
+// in flight takes neither the result nor the error.
+async function runDialogAction(action, context) {
+  if (dialogBusy.value) return false
+  const mine = ++dialogSeq
+  dialogBusy.value = true
+  dialogError.value = ''
+  try {
+    await action()
+    if (mine === dialogSeq) closeDialog()
+    return true
+  } catch (err) {
+    if (mine === dialogSeq) { dialogError.value = t(fireErrorKey(err, context)); dialogBusy.value = false }
+  }
+  return false
+}
+
+async function submitReport({ notes }) {
+  const target = dialog.value?.target
+  if (!target) return
+  if (target.noPosition) return
+  const body = { latitude: target.latitude, longitude: target.longitude, notes }
+  // A 404 here means the running backend lacks the field-report endpoint (older than T18).
+  if (await runDialogAction(() => fireStore.reportFire(body), 'report')) ensureLayer('hotspots')
+}
+
+async function submitZone(values) {
+  const d = dialog.value
+  if (d?.kind !== 'zone') return
+  const body = { ...values, latitude: d.latitude, longitude: d.longitude }
+  if (await runDialogAction(() => fireStore.createZone(body))) ensureLayer('zones')
+}
+
+// ── Volunteer selection and "Report fire at this position" ───────────────────────────────────
+// Selecting a volunteer (panel row, or their marker on the map) reveals the action under their row.
+const selectedDeviceId = ref(null)
+
+function selectDevice(pos) {
+  selectedDeviceId.value = pos.device_id
+  focusDevice(pos)
+}
+
+// The position is frozen here, at the click: the volunteer keeps moving while the operator types,
+// and what the form shows is exactly what is sent. No position, or none from the last 24 h
+// (judged on received_at, the server clock), means nothing can be reported.
+const REPORT_MAX_AGE_MS = 24 * 3_600_000
+function reportFromRow(pos) {
+  const live = store.positions[pos.device_id] ?? null
+  const name = pos.full_name || pos.device_name || String(pos.dev_sn ?? '')
+  const age = live ? ageMs(live) : null
+  const lat = Number(live?.latitude), lon = Number(live?.longitude)
+  const usable = !!live && live.latitude != null && live.longitude != null
+    && Number.isFinite(lat) && Number.isFinite(lon) && age != null && age <= REPORT_MAX_AGE_MS
+  openDialog({
+    kind: 'report',
+    target: usable
+      ? { name, latitude: lat, longitude: lon, mgrs: live.mgrs ?? '', receivedAt: contactAt(live), gnssValid: live.gnss_valid }
+      : { name, noPosition: true },
+  })
+}
+
+// A marker click selects that volunteer's row and brings it into view; bare map deselects.
+const trackerPanelEl = ref(null)
+async function onMarkerClick(deviceId) {
+  selectedDeviceId.value = deviceId
+  if (!deviceId) return
+  await nextTick()
+  const row = [...(trackerPanelEl.value?.querySelectorAll('[data-device-id]') ?? [])].find(el => el.dataset.deviceId === deviceId)
+  row?.scrollIntoView?.({ block: 'nearest' })
+}
+// A volunteer who left the list cannot stay selected.
+watch(displayList, (list) => {
+  if (selectedDeviceId.value && !list.some(p => p.device_id === selectedDeviceId.value)) selectedDeviceId.value = null
+})
+
+// ── Right-click / long-press: "Report fire here" ─────────────────────────────────────────────
+const ctxMenu   = ref(null)   // { x, y, coordinate } | null
+const ctxMenuEl = ref(null)
+
+function closeContextMenu() {
+  if (!ctxMenu.value) return
+  ctxMenu.value = null
+  document.removeEventListener('pointerdown', onOutsidePointer, true)
+  document.removeEventListener('keydown', onMenuKey, true)
+}
+function onOutsidePointer(e) { if (!ctxMenuEl.value?.contains(e.target)) closeContextMenu() }
+function onMenuKey(e) { if (e.key === 'Escape') closeContextMenu() }
+
+async function openContextMenu({ coordinate, pixel }) {
+  const width = mapEl.value?.clientWidth ?? 0
+  const height = mapEl.value?.clientHeight ?? 0
+  // Keep the menu inside the map (about 190 x 44 px).
+  const x = Math.max(4, Math.min(pixel[0], width ? width - 196 : pixel[0]))
+  const y = Math.max(4, Math.min(pixel[1], height ? height - 52 : pixel[1]))
+  const first = !ctxMenu.value
+  ctxMenu.value = { x, y, coordinate }
+  if (first) {
+    document.addEventListener('pointerdown', onOutsidePointer, true)
+    document.addEventListener('keydown', onMenuKey, true)
+  }
+  await nextTick()
+  ctxMenuEl.value?.querySelector('button')?.focus()
+}
+
+function reportFromMenu() {
+  const c = ctxMenu.value?.coordinate
+  if (!c) return
+  const [lon, lat] = toLonLat(c)
+  openDialog({ kind: 'report', target: { latitude: lat, longitude: lon } })
+}
+
+// What the pill says; the priority rules live in lib/fireStyle.js (firePillState).
+const firePill = computed(() => {
+  const at = fireStore.shownFetchedAt
+  const time = at
+    ? new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : ''
+  const state = firePillState({
+    at, upstreamState: fireStore.shownUpstreamState, failed: fireStore.fetchFailed, nowMs: nowTick.value,
+  })
+  return { kind: state.kind, time, note: state.noteKey ? t(state.noteKey) : '' }
+})
+
+onMounted(() => {
+  const m = map()
+  if (!m) return
+  const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+  fireOverlay = new Overlay({
+    element: firePopupEl.value,
+    positioning: 'bottom-center',
+    offset: [0, -16],
+    stopEvent: true,
+    autoPan: { animation: { duration: reduce ? 0 : 200 }, margin: 24 },
+  })
+  fireMap = m
+  m.addOverlay(fireOverlay)
+  focusOverlay = new Overlay({ element: focusRingEl.value, positioning: 'center-center', stopEvent: false })
+  m.addOverlay(focusOverlay)
+  onFireFeatureClick(async (sel) => {
+    fireError.value = ''
+    firePopup.value = sel
+    // The popup has no size until Vue renders it; position after that so OpenLayers
+    // anchors it by its real width and height.
+    await nextTick()
+    fireOverlay.setPosition(sel ? sel.coordinate : undefined)
+  })
+  setFireLabels({ fieldReport: t('fire.source.field_report') })
+  // Layers remembered from the last session show again after a reload.
+  for (const name of FIRE_LAYER_BUTTONS) setFireLayerVisible(name, fireStore.layers[name] && (name !== 'zones' || isAdmin.value))
+  fireStore.refreshVisible().catch(() => { /* fetchFailed drives the pill */ })
+  if (isAdmin.value && fireStore.layers.zones) retryZones()
+})
+
+// immediate: a remounted MapView shows what the store already holds even if its own first
+// refresh fails.
+watch(() => fireStore.hotspots,   (fc) => { if (!setHotspots(fc))   fireStore.markFeedFailed('hotspots') }, { immediate: true })
+watch(() => fireStore.burntAreas, (fc) => { if (!setBurntAreas(fc)) fireStore.markFeedFailed('burnt') },    { immediate: true })
+watch(locale, () => setFireLabels({ fieldReport: t('fire.source.field_report') }))
+// Only active zones are drawn; Settings may have loaded disabled ones into the same list.
+watch(() => fireStore.zones, (list) => setZones(list.filter(z => z.is_active)), { immediate: true })
+
+onTrackerClick(onMarkerClick)
+onMapContextMenu(openContextMenu)
+
+// Repeaters have no GNSS: an admin places each one by hand, like HQ. Everyone sees the placed ones.
+const repeaters     = ref([])
+const repeaterMode  = ref(false)
+const repeaterId    = ref(null)
+const repeaterError = ref(false)
+const selectedRepeater = computed(() => repeaters.value.find(r => r.id === repeaterId.value) || null)
+
+async function loadRepeaters() {
+  try {
+    repeaters.value = (await getDevices()).filter(d => d.device_type === 'repeater')
+  } catch { /* the map does not depend on repeaters; keep what is drawn */ }
+}
+watch(repeaters, (list) => setRepeaters(list), { immediate: true })
+
+async function saveRepeater(id, lat, lon) {
+  repeaterError.value = false
+  try {
+    const row = await setDeviceLocation(id, lat, lon)
+    repeaters.value = repeaters.value.map(r => (r.id === id ? { ...r, ...row } : r))
+  } catch {
+    repeaterError.value = true
+  }
+}
+onRepeaterPlaced(({ lat, lon }) => {
+  if (!repeaterId.value) return
+  repeaterMode.value = false
+  setRepeaterPlacementMode(false)
+  saveRepeater(repeaterId.value, lat, lon)
+})
+function clearRepeater() {
+  if (!repeaterId.value) return
+  repeaterMode.value = false
+  setRepeaterPlacementMode(false)
+  saveRepeater(repeaterId.value, null, null)
+}
+function toggleRepeaterMode() {
+  repeaterMode.value = !repeaterMode.value
+  if (repeaterMode.value) {
+    // Default to the first repeater not yet placed, so placing a fresh batch is click, click, click.
+    if (!selectedRepeater.value) repeaterId.value = (repeaters.value.find(r => r.site_latitude == null) || repeaters.value[0])?.id ?? null
+    if (measureOn.value) { measureOn.value = false; setMeasureMode(false) }
+    if (hqMode.value) { hqMode.value = false; setHQPlacementMode(false) }
+  }
+  setRepeaterPlacementMode(repeaterMode.value)
+}
 
 function reloadOfflineBasemap() {
   if (activeBasemap.value === 'offline') {
     setBasemap('offline')
   }
 }
+
+
 
 onMounted(async () => {
   await Promise.all([store.fetchLive(), store.fetchSOS(), store.fetchTrail()])
@@ -340,12 +810,20 @@ onMounted(async () => {
   const m = map()
   if (m) m.on('moveend', scheduleWeatherFetch)
 
-  if (hqLocation.value) setHQ(hqLocation.value)
-
   window.addEventListener('offline-map-changed', reloadOfflineBasemap)
+  
+  // HQ comes from the database. A failure shows an amber note with a retry; the map and live
+  // data do not depend on it.
+  await loadSettings()
+  await loadRepeaters()
+
+  tickTimer = setInterval(() => { nowTick.value = Date.now() }, 10_000)
 })
 
-watch(hqLocation, (loc) => setHQ(loc))
+// Redraw only when the point moves, not on every settings save.
+watch(hqLocation, (v) => { if (!v) hqClearAsk.value = false })
+watch(() => hqLocation.value && `${hqLocation.value.lat},${hqLocation.value.lon}`,
+  () => setHQ(hqLocation.value), { immediate: true })
 
 onUnmounted(() => {
   clearTimeout(weatherTimer)
@@ -355,6 +833,19 @@ onUnmounted(() => {
   if (m) m.un('moveend', scheduleWeatherFetch)
 
   window.removeEventListener('offline-map-changed', reloadOfflineBasemap)
+
+  // The popup overlay belongs to this view; do not leave it on a map that outlives it.
+  onFireFeatureClick(null)
+  onTrackerClick(null)
+  onMapContextMenu(null)
+  onRepeaterPlaced(null)
+  closeContextMenu()
+  if (fireOverlay) fireMap?.removeOverlay(fireOverlay)
+  if (focusOverlay) fireMap?.removeOverlay(focusOverlay)
+  clearTimeout(focusRingTimer)
+  fireOverlay = null
+  focusOverlay = null
+  fireMap = null
 })
 
 function switchBasemap(id) {
@@ -394,6 +885,10 @@ function toggleMeasure() {
     hqMode.value = false
     setHQPlacementMode(false)
   }
+  if (measureOn.value && repeaterMode.value) {
+    repeaterMode.value = false
+    setRepeaterPlacementMode(false)
+  }
   setMeasureMode(measureOn.value)
 }
 function toggleHQMode() {
@@ -402,11 +897,15 @@ function toggleHQMode() {
     measureOn.value = false
     setMeasureMode(false)
   }
+  if (hqMode.value && repeaterMode.value) {
+    repeaterMode.value = false
+    setRepeaterPlacementMode(false)
+  }
   setHQPlacementMode(hqMode.value)
 }
 function clearHQ() {
-  hqLocation.value = null
-  localStorage.removeItem(HQ_STORAGE_KEY)
+  hqClearAsk.value = false
+  saveHQ(() => settingsStore.clearHQ())
   if (hqMode.value) {
     hqMode.value = false
     setHQPlacementMode(false)
@@ -415,9 +914,9 @@ function clearHQ() {
 function toggleWeather(id) {
   weatherLayerId.value = weatherLayerId.value === id ? null : id
   const url = weatherLayerId.value
-    ? `https://tile.openweathermap.org/map/${weatherLayerId.value}/{z}/{x}/{y}.png?appid=${OWM_KEY}`
+    ? `/api/weather/tiles/${weatherLayerId.value}/{z}/{x}/{y}.png`
     : null
-  setWeatherLayer(url)
+  setWeatherLayer(url, recolorFor(weatherLayerId.value))
   if (!weatherLayerId.value) weatherInfo.value = null
   else if (weatherLayerId.value !== 'wind_new') fetchWeather()
 }
@@ -437,28 +936,12 @@ async function fetchWeather() {
   if (!m) return
   const [lon, lat] = toLonLat(m.getView().getCenter())
   try {
-    const r = await fetch(
-      `https://api.openweathermap.org/data/2.5/weather?lat=${lat.toFixed(4)}&lon=${lon.toFixed(4)}&appid=${OWM_KEY}&units=metric`
-    )
-    const d = await r.json()
-    weatherInfo.value = {
-      temp:      Math.round(d.main.temp),
-      feelsLike: Math.round(d.main.feels_like),
-      humidity:  d.main.humidity,
-      clouds:    d.clouds.all,
-      windSpeed: d.wind?.speed ?? 0,
-      windDeg:   d.wind?.deg ?? 0,
-      windDir:   windDirLabel(d.wind?.deg),
-      desc:      d.weather?.[0]?.description ?? '',
-      icon:      d.weather?.[0]?.icon ?? '01d',
-      city:      d.name ?? '',
-    }
-  } catch { /* network unavailable */ }
+    weatherInfo.value = weatherFromOwm(await getWeatherCurrent(+lat.toFixed(4), +lon.toFixed(4)))
+  } catch { /* network unavailable, or weather not configured on the server */ }
 }
 
 function windDirLabel(deg) {
-  if (deg == null) return ''
-  return ['N','NE','E','SE','S','SW','W','NW'][Math.round(deg / 45) % 8]
+  return compassFrom(deg)
 }
 
 // ── Wind particle animation ──────────────────────────────────────────────────
@@ -468,76 +951,123 @@ const TRAIL_LEN      = 10
 const SPEED_SCALE    = 45      // px/s per m/s
 const GRID_COLS      = 14
 const GRID_ROWS      = 9
+// Open-Meteo sample grid over the (padded) view: 20 points in one keyless request.
+const SAMPLE_COLS    = 5
+const SAMPLE_ROWS    = 4
 let   windParticles  = []
 let   windAnimFrame  = null
 let   windLastTime   = null
-let   windField      = []      // [{lat,lon,vxNorm,vyNorm,speed}]
+let   windField      = []      // [{lat,lon,deg,speed,vxNorm,vyNorm}] (lib/wind.js windPoint)
 let   windGrid       = null    // GRID_ROWS × GRID_COLS [{vx,vy}] in px/s
+let   windMarks      = []      // measured points in canvas pixels, drawn as arrows
+let   windGridDirty  = false   // the view moved: rebuild grid and arrows on the next frame
+let   windViewKey    = null
+let   windFetchSeq   = 0
+// box/city needs a paid OWM plan. After a 401/403 it is not asked again this session, so the free
+// tier does not pay a failed request on every pan. The code path stays for when the plan allows it.
+let   boxCityDenied  = false
+const windSource     = ref(null)   // 'owm-box' | 'open-meteo' | 'owm-point'
+const windSourceLabel = computed(() => ({
+  'owm-box': 'OpenWeatherMap', 'open-meteo': 'Open-Meteo.com', 'owm-point': 'OpenWeatherMap (1 point)',
+})[windSource.value] ?? '')
 
-// Fetch wind vectors for all cities in the current viewport (single API call)
-// Requires OWM plan that includes data/2.5/box/city. Falls back to single-point if unavailable.
+function weatherFromOwm(c) {
+  return {
+    temp:      Math.round(c.main.temp),
+    feelsLike: Math.round(c.main.feels_like),
+    humidity:  c.main.humidity,
+    clouds:    c.clouds?.all ?? 0,
+    windSpeed: c.wind?.speed ?? 0,
+    windDeg:   c.wind?.deg ?? 0,
+    windDir:   windDirLabel(c.wind?.deg),
+    windGust:  c.wind?.gust ?? null,
+    desc:      c.weather?.[0]?.description ?? '',
+    icon:      c.weather?.[0]?.icon ?? '01d',
+    city:      c.name ?? '',
+  }
+}
+
+// Wind for the current view, best source first:
+//   1. OWM box/city (paid plan): real stations, and the panel uses the nearest one.
+//   2. Open-Meteo: a 5 × 4 grid over the view in one request, no key.
+//   3. OWM single point at the centre: the whole view then blows one way (last resort).
 async function fetchWindField() {
   const canvas = windCanvas.value
   const m = map()
   if (!canvas || !m) return
+  const seq = ++windFetchSeq
   const size   = m.getSize()
   const extent = m.getView().calculateExtent(size)
   const pad    = (extent[2] - extent[0]) * 0.15
   const [minLon, minLat] = toLonLat([extent[0] - pad, extent[1] - pad])
   const [maxLon, maxLat] = toLonLat([extent[2] + pad, extent[3] + pad])
+  const [cLon, cLat] = toLonLat(m.getView().getCenter())
   const zoom = Math.max(3, Math.min(14, Math.floor(m.getView().getZoom() ?? 7)))
-  let usedMultiPoint = false
-  try {
-    const r = await fetch(
-      `https://api.openweathermap.org/data/2.5/box/city?bbox=${minLon.toFixed(2)},${minLat.toFixed(2)},${maxLon.toFixed(2)},${maxLat.toFixed(2)},${zoom}&appid=${OWM_KEY}&units=metric&cnt=50`
-    )
-    const d = await r.json()
-    if (r.ok && Array.isArray(d.list) && d.list.length) {
-      windField = d.list
-        .filter(c => c.wind?.speed > 0)
-        .map(c => {
-          const rad = (c.wind.deg ?? 0) * Math.PI / 180
-          return { lat: c.coord.lat, lon: c.coord.lon,
-                   vxNorm: -Math.sin(rad), vyNorm: Math.cos(rad), speed: c.wind.speed }
-        })
-      buildWindGrid(canvas, m)
-      const [cLon, cLat] = toLonLat(m.getView().getCenter())
-      let nearest = d.list[0], minD = Infinity
-      for (const c of d.list) {
-        const dd = (c.coord.lon - cLon) ** 2 + (c.coord.lat - cLat) ** 2
-        if (dd < minD) { minD = dd; nearest = c }
-      }
-      weatherInfo.value = {
-        temp:      Math.round(nearest.main.temp),
-        feelsLike: Math.round(nearest.main.feels_like),
-        humidity:  nearest.main.humidity,
-        clouds:    nearest.clouds?.all ?? 0,
-        windSpeed: nearest.wind?.speed ?? 0,
-        windDeg:   nearest.wind?.deg ?? 0,
-        windDir:   windDirLabel(nearest.wind?.deg),
-        desc:      nearest.weather?.[0]?.description ?? '',
-        icon:      nearest.weather?.[0]?.icon ?? '01d',
-        city:      nearest.name ?? '',
-      }
-      usedMultiPoint = true
-    }
-  } catch { /* fall through */ }
+  let points = null, source = null
 
-  if (!usedMultiPoint) {
+  if (!boxCityDenied) {
+    try {
+      const d = await getWeatherBox(
+        [minLon, minLat, maxLon, maxLat].map(v => v.toFixed(2)).join(','), zoom
+      )
+      if (d?.denied) boxCityDenied = true
+      if (Array.isArray(d?.list) && d.list.length) {
+        points = d.list
+          .filter(c => c.wind?.speed > 0)
+          .map(c => windPoint(c.coord.lat, c.coord.lon, c.wind.deg ?? 0, c.wind.speed))
+        if (seq === windFetchSeq) {
+          const nearest = d.list.reduce((a, c) =>
+            (c.coord.lon - cLon) ** 2 + (c.coord.lat - cLat) ** 2 < (a.coord.lon - cLon) ** 2 + (a.coord.lat - cLat) ** 2 ? c : a)
+          weatherInfo.value = weatherFromOwm(nearest)
+        }
+        source = 'owm-box'
+      }
+    } catch { /* fall through */ }
+  }
+
+  if (!points?.length) {
+    try {
+      const r = await fetch(openMeteoUrl(gridPoints(minLon, minLat, maxLon, maxLat, SAMPLE_COLS, SAMPLE_ROWS)))
+      const parsed = r.ok ? parseOpenMeteo(await r.json()) : []
+      if (parsed.length) {
+        points = parsed
+        source = 'open-meteo'
+        // Temperature, clouds etc. still come from OWM at the centre; the wind shown is the
+        // Open-Meteo sample nearest the centre, so the panel and the particles agree.
+        await fetchWeather()
+        const near = nearestPoint(parsed, cLon, cLat)
+        if (seq === windFetchSeq && weatherInfo.value && near) {
+          weatherInfo.value = { ...weatherInfo.value, windSpeed: near.speed, windDeg: near.deg,
+                                windDir: windDirLabel(near.deg), windGust: near.gust }
+        }
+      }
+    } catch { /* fall through */ }
+  }
+
+  if (!points?.length) {
     await fetchWeather()
     if (weatherInfo.value) {
-      const rad = (weatherInfo.value.windDeg ?? 0) * Math.PI / 180
-      windField = [{ lat: 0, lon: 0,
-        vxNorm: -Math.sin(rad), vyNorm: Math.cos(rad), speed: weatherInfo.value.windSpeed }]
-      buildWindGrid(canvas, m)
+      points = [windPoint(cLat, cLon, weatherInfo.value.windDeg ?? 0, weatherInfo.value.windSpeed)]
+      source = 'owm-point'
     }
   }
+
+  if (seq !== windFetchSeq || !points?.length) return   // a newer pan already asked again
+  windField = points
+  windSource.value = source
+  buildWindGrid(canvas, m)
 }
 
-// Build an interpolated wind grid (IDW) so per-particle lookups are O(1)
+// Build an interpolated wind grid (IDW) so per-particle lookups are O(1), and place the
+// measured points (arrows) in canvas pixels. Cheap: rebuilt whenever the view moves.
 function buildWindGrid(canvas, m) {
+  windGridDirty = false
   if (!windField.length) return
   const { width, height } = canvas
+  windMarks = windField.length < 2 ? [] : windField.flatMap(pt => {
+    const px = m.getPixelFromCoordinate(fromLonLat([pt.lon, pt.lat]))
+    return px ? [{ x: px[0], y: px[1], ux: pt.vxNorm, uy: pt.vyNorm, speed: pt.speed }] : []
+  })
   windGrid = Array.from({ length: GRID_ROWS }, (_, gy) =>
     Array.from({ length: GRID_COLS }, (_, gx) => {
       const px = (gx + 0.5) * width  / GRID_COLS
@@ -557,6 +1087,39 @@ function buildWindGrid(canvas, m) {
       return sw > 0 ? { vx: sx / sw * SPEED_SCALE, vy: sy / sw * SPEED_SCALE } : { vx: 0, vy: 0 }
     })
   )
+}
+
+// One arrow per measured point, pointing downwind, with the speed (m/s) beside its tail (the side the
+// wind comes from). Dark under light so it reads on every basemap.
+function drawWindMarks(ctx) {
+  ctx.save()
+  ctx.lineCap = 'round'
+  ctx.lineJoin = 'round'
+  ctx.font = '600 11px system-ui'
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  for (const k of windMarks) {
+    const len = 22
+    const tx = k.x - k.ux * len / 2, ty = k.y - k.uy * len / 2   // tail: upwind
+    const hx = k.x + k.ux * len / 2, hy = k.y + k.uy * len / 2   // head: downwind
+    const ax = -k.uy, ay = k.ux                                   // perpendicular
+    const path = () => {
+      ctx.beginPath()
+      ctx.moveTo(tx, ty); ctx.lineTo(hx, hy)
+      ctx.moveTo(hx - k.ux * 7 + ax * 5, hy - k.uy * 7 + ay * 5); ctx.lineTo(hx, hy)
+      ctx.lineTo(hx - k.ux * 7 - ax * 5, hy - k.uy * 7 - ay * 5)
+    }
+    path(); ctx.strokeStyle = 'rgba(8,12,20,0.85)'; ctx.lineWidth = 5; ctx.stroke()
+    path(); ctx.strokeStyle = '#f8fafc';           ctx.lineWidth = 2; ctx.stroke()
+    const label = `${k.speed.toFixed(1)} m/s`
+    // Centre the label beyond the tail, far enough along the arrow's line that its box clears it.
+    const half = ctx.measureText(label).width / 2
+    const gap = 6 + Math.abs(k.ux) * half + Math.abs(k.uy) * 7
+    const lx = tx - k.ux * gap, ly = ty - k.uy * gap
+    ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(8,12,20,0.85)'; ctx.strokeText(label, lx, ly)
+    ctx.fillStyle = '#f8fafc'; ctx.fillText(label, lx, ly)
+  }
+  ctx.restore()
 }
 
 function getWindAt(px, py, w, h) {
@@ -579,6 +1142,8 @@ function startWindAnim() {
   canvas.height = rect.height
   windLastTime  = null
   windParticles = Array.from({ length: PARTICLE_COUNT }, () => mkParticle(canvas.width, canvas.height))
+  const view = map()?.getView()
+  if (view) windViewKey = view.on(['change:center', 'change:resolution', 'change:rotation'], () => { windGridDirty = true })
   windAnimFrame = requestAnimationFrame(runWindAnim)
 }
 
@@ -589,6 +1154,10 @@ function stopWindAnim() {
   windLastTime  = null
   windField     = []
   windGrid      = null
+  windMarks     = []
+  windSource.value = null
+  if (windViewKey) unByKey(windViewKey)
+  windViewKey   = null
 }
 
 function runWindAnim(ts) {
@@ -599,6 +1168,7 @@ function runWindAnim(ts) {
   if (!windLastTime) windLastTime = ts
   const dt = Math.min((ts - windLastTime) / 1000, 0.05)
   windLastTime = ts
+  if (windGridDirty) { const m = map(); if (m) buildWindGrid(canvas, m) }
   ctx.clearRect(0, 0, width, height)
   for (const p of windParticles) {
     p.trail.push({ x: p.x, y: p.y })
@@ -625,6 +1195,7 @@ function runWindAnim(ts) {
     ctx.lineCap     = 'round'
     ctx.stroke()
   }
+  drawWindMarks(ctx)
   windAnimFrame = requestAnimationFrame(runWindAnim)
 }
 
@@ -636,6 +1207,31 @@ watch(weatherLayerId, async (id) => {
     fetchWindField()
   }
 })
+// "Show on map" from a fire alarm (FireAlarmBanner). The view is kept alive, so a request can
+// land while it is hidden: it waits until the map is on screen, then centres once and is cleared.
+const mapActive = ref(false)
+function consumeFireFocus() {
+  const req = fireStore.focusRequest
+  const m = map()
+  if (!req || !m || !mapActive.value) return
+  fireStore.clearFocusRequest()
+  // The fire is drawn on the hotspots layer, which is off by default: centring on it with the
+  // layer off showed an empty map, as if the button did nothing.
+  ensureLayer('hotspots')
+  const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+  const center = fromLonLat([req.longitude, req.latitude])
+  m.updateSize()
+  m.getView().animate({ center, zoom: 12, duration: reduce ? 0 : 500 })
+  // Mark the spot itself, so it is found at once even before the hotspot data has drawn.
+  focusOverlay?.setPosition(center)
+  focusRingKey.value++
+  clearTimeout(focusRingTimer)
+  focusRingTimer = setTimeout(() => { focusRingKey.value = 0; focusOverlay?.setPosition(undefined) }, FOCUS_RING_MS)
+}
+watch(() => fireStore.focusRequest, consumeFireFocus)
+onActivated(() => { mapActive.value = true; nextTick(consumeFireFocus); loadRepeaters() })
+onDeactivated(() => { mapActive.value = false })
+
 function focusDevice(pos) {
   const m = map()
   if (m) m.getView().animate({ center: fromLonLat([pos.longitude, pos.latitude]), zoom: 13, duration: 500 })
@@ -688,7 +1284,42 @@ function batClass(v) {
 .bm-btn-weather.active { background: #0369a1; border-color: #0369a1; }
 .bm-btn-danger { color: #f87171; border-color: rgba(248,113,113,0.35); }
 .bm-btn-danger:hover { background: rgba(248,113,113,0.1); color: #fca5a5; }
+.bm-hq-error { font-size: 12px; color: var(--warning); align-self: center; }
+.bm-hq-confirm, .bm-hq-note { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; align-self: center; }
+.bm-hq-confirm { color: var(--text); }
+.bm-hq-note { color: var(--warning); }
+.bm-btn:disabled { opacity: .45; cursor: not-allowed; }
+.bm-select { background: var(--bg-panel); border: 1px solid var(--border); color: var(--text); padding: 4px 6px; font-size: 12px; border-radius: 4px; width: auto; }
 .bm-row-break { flex-basis: 100%; height: 0; }
+
+/* Fire data freshness. Neutral when live, muted when quiet or unknown, amber (never red)
+   when stale or failed: red is reserved for alarms. */
+.fire-pill {
+  position: absolute; top: 48px; left: 12px; z-index: 50;
+  display: flex; flex-direction: column; gap: 2px;
+  max-width: 300px; padding: 5px 10px;
+  background: var(--bg-panel); border: 1px solid var(--border);
+  border-radius: 4px; font-size: 12px; color: var(--text);
+}
+.fire-pill-main { font-weight: 600; }
+.fire-time { font-family: monospace; font-variant-numeric: tabular-nums; }
+.fire-pill-note { font-size: 11px; color: var(--text-muted); line-height: 1.35; }
+.fire-unknown .fire-pill-main, .fire-quiet .fire-pill-main { color: var(--text-muted); }
+.fire-error {
+  border-color: var(--warning-line);
+  background: linear-gradient(var(--warning-wash), var(--warning-wash)), var(--bg-panel);
+}
+.fire-error .fire-pill-main, .fire-error .fire-pill-note { color: var(--warning); }
+
+.fire-attribution {
+  position: absolute; bottom: 8px; left: 12px; z-index: 50;
+  max-width: max(calc(100% - 300px), 200px); padding: 2px 6px;
+  background: rgba(15,17,23,.78); border-radius: 3px;
+  font-size: 10.5px; line-height: 1.35; color: var(--text-muted);
+  pointer-events: none;
+}
+/* Not positioned: OpenLayers sizes its overlay container from this element. */
+.fire-popup-anchor { display: block; }
 
 .tracker-panel {
   width: 260px; background: var(--bg-panel); border-left: 1px solid var(--border);
@@ -716,6 +1347,30 @@ function batClass(v) {
 .tracker-row.fresh-stale { border-left: 3px solid rgba(234,179,8,.55); }
 .tracker-row.fresh-lost  { border-left: 3px solid rgba(156,163,175,.5); }
 .tracker-row.tracker-sos { border-left: 3px solid var(--danger); }
+
+/* Selected volunteer: Signal Blue hairline (outline, not a side stripe) on the raised ground, and the
+   report action underneath. */
+.tracker-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.tracker-row.tracker-selected { background: var(--bg-card); outline: 1px solid var(--accent); outline-offset: -1px; }
+.tracker-actions { padding: 8px 14px 10px; background: var(--bg-card); border-bottom: 1px solid var(--border); }
+.tracker-report {
+  width: 100%; min-height: 34px; padding: 6px 10px; font-size: 12.5px; font-weight: 600; line-height: 1.3;
+  background: var(--bg-panel); color: var(--text); border: 1px solid var(--accent); border-radius: 6px;
+}
+.tracker-report:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (hover: hover) and (pointer: fine) { .tracker-report:hover { background: var(--accent); color: #fff; opacity: 1; } }
+
+.map-context {
+  position: absolute; z-index: 65; min-width: 180px; padding: 4px;
+  background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, .55);
+}
+.mc-item {
+  display: block; width: 100%; text-align: left; padding: 9px 12px; min-height: 36px;
+  background: transparent; color: var(--text); font-size: 13px; font-weight: 600; border-radius: 6px;
+}
+.mc-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; background: var(--bg-card); }
+@media (hover: hover) and (pointer: fine) { .mc-item:hover { background: var(--bg-card); opacity: 1; } }
 
 .tracker-meta { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
 .tracker-age {
@@ -784,8 +1439,24 @@ function batClass(v) {
   animation: feed-blink 1.6s ease-in-out infinite;
 }
 @keyframes feed-blink { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+
+/* "Show on map" ring: fire-alarm orange (the alarm the operator came from), dark halo for light
+   basemaps. Pulses a few times, then holds until it is removed. */
+.fire-focus-anchor { pointer-events: none; }
+.fire-focus-ring {
+  width: 56px; height: 56px; border-radius: 50%;
+  border: 3px solid var(--fire-alarm);
+  box-shadow: 0 0 0 2px rgba(0,0,0,.55), inset 0 0 0 2px rgba(0,0,0,.55);
+  animation: fire-focus-pulse 1.2s ease-out 4;
+}
+@keyframes fire-focus-pulse {
+  0%   { transform: scale(.5); opacity: 1; }
+  70%  { transform: scale(1.15); opacity: .9; }
+  100% { transform: scale(1); opacity: 1; }
+}
 @media (prefers-reduced-motion: reduce) {
   .stale-feed-dot { animation: none; }
+  .fire-focus-ring { animation: none; }
 }
 
 .tracker-dot  { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
@@ -884,6 +1555,8 @@ function batClass(v) {
 .weather-rows { display: flex; flex-direction: column; gap: 4px; }
 .weather-row { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
 .weather-label { color: var(--text-muted); }
+.weather-wind { display: inline-flex; align-items: center; gap: 5px; }
+.wind-arrow { display: inline-block; font-weight: 700; line-height: 1; }
 .weather-city { color: var(--text-muted); font-size: 11px; margin-top: 4px; text-align: right; }
 .weather-legend { margin-top: 10px; padding-top: 8px; border-top: 1px solid rgba(255,255,255,0.08); }
 .legend-bar { height: 8px; border-radius: 4px; width: 100%; }

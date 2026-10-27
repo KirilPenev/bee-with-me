@@ -14,6 +14,7 @@ const routes = [
       { path: 'devices', component: () => import('../views/DevicesView.vue') },
       { path: 'export',  component: () => import('../views/ExportView.vue') },
       { path: 'selectofflinemap', component: () => import('../views/SelectOfflineMap.vue') },
+      { path: 'settings', component: () => import('../views/SettingsView.vue'), meta: { adminOnly: true } },
       { path: 'about',   component: () => import('../views/AboutView.vue') },
     ],
   },
@@ -21,9 +22,20 @@ const routes = [
 
 const router = createRouter({ history: createWebHistory(), routes })
 
-router.beforeEach((to) => {
+export async function guard(to) {
   const auth = useAuthStore()
   if (!to.meta.public && !auth.token) return '/login'
-})
+  // The guard is the control; hiding the nav item is cosmetic. The API enforces the role too.
+  if (to.meta.adminOnly) {
+    try {
+      if (!auth.user) await auth.fetchMe()
+    } catch {
+      return '/map'
+    }
+    if (auth.user?.role !== 'admin') return '/map'
+  }
+}
+
+router.beforeEach(guard)
 
 export default router

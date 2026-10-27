@@ -3,7 +3,14 @@ const fs = require('fs')
 const path = require('path')
 const Database = require('better-sqlite3')
 
-const PORT = 8080
+require('dotenv').config({
+  path: path.join(__dirname, '..', '.env')
+})
+
+const HOST = process.env.VITE_TILE_HOST;
+const PORT = process.env.VITE_TILE_PORT;
+
+const TILE_SERVER = `http://${HOST}:${PORT}`
 
 const MAPS_DIR = path.join(__dirname, 'maps')
 
@@ -395,7 +402,7 @@ const server =
         const url =
           new URL(
             req.url,
-            `http://localhost:${PORT}`
+            `${TILE_SERVER}`
           )
 
         const pathname =
@@ -648,7 +655,7 @@ const server =
 
 server.listen(
   PORT,
-  '127.0.0.1',
+  HOST,
   () => {
 
     console.log('')
@@ -661,7 +668,7 @@ server.listen(
     )
 
     console.log(
-      `http://127.0.0.1:${PORT}`
+      `${TILE_SERVER}`
     )
 
     console.log(
